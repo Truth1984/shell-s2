@@ -51,12 +51,12 @@ if [ -n "${U_UPDATE_URL:-}" ]; then
   URLS="$U_UPDATE_URL
 "
 fi
-URLS="${URLS}${RAW}
-https://fastgit.cc/${RAW}
-http://gh.ddlc.top/${RAW}
-http://ghfast.top/${RAW}
+URLS="${URLS}https://fastgit.cc/${RAW}
+https://cdn.akaere.online/${RAW}
 https://ghproxy.monkeyray.net/${RAW}
-https://cdn.akaere.online/${RAW}"
+http://ghfast.top/${RAW}
+http://gh.ddlc.top/${RAW}
+${RAW}"
 
 ok=0
 while IFS= read -r url; do

@@ -23,6 +23,27 @@ Maintainers should read `.agent/private/instruction.md` before changing code.
 
 ## Install
 
+China-first: the installer and `u` are fetched through a mirror.
+
+```sh
+curl -fsSL https://fastgit.cc/https://raw.githubusercontent.com/Truth1984/shell-s2/main/setup.sh \
+  | U_UPDATE_URL=https://fastgit.cc/https://raw.githubusercontent.com/Truth1984/shell-s2/main/u bash
+```
+
+If that mirror is down, swap `fastgit.cc` for one of these:
+
+```sh
+# cdn.akaere.online
+curl -fsSL https://cdn.akaere.online/https://raw.githubusercontent.com/Truth1984/shell-s2/main/setup.sh \
+  | U_UPDATE_URL=https://cdn.akaere.online/https://raw.githubusercontent.com/Truth1984/shell-s2/main/u bash
+
+# ghproxy.monkeyray.net
+curl -fsSL https://ghproxy.monkeyray.net/https://raw.githubusercontent.com/Truth1984/shell-s2/main/setup.sh \
+  | U_UPDATE_URL=https://ghproxy.monkeyray.net/https://raw.githubusercontent.com/Truth1984/shell-s2/main/u bash
+```
+
+Direct GitHub, outside mainland China or with a working proxy:
+
 ```sh
 curl -fsSL https://raw.githubusercontent.com/Truth1984/shell-s2/main/setup.sh | bash
 ```
