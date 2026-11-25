@@ -1,0 +1,16 @@
+# Local agent wiring: private state, shared knowledge and scripts.
+.agent/
+
+# Private project docs are never public. Do not ignore project.md, failures.md
+# or workflows/ here: if one appears in this tree, it must show up as untracked.
+
+# Local logs and OS noise
+.locks/
+*.log
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# Scratch space used by tests
+test/tmp/

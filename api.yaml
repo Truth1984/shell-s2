@@ -1,0 +1,312 @@
+version: 1
+binary: u
+summary: "One small cross-platform CLI for daily shell tasks. This file is the command and flag catalog."
+
+globalFlags:
+  - {flag: "--debug", description: "emit debug events on stderr"}
+  - {flag: "--json", description: "machine-readable stdout for version, commands and doctor"}
+  - {flag: "--yes", description: "skip interactive confirmation"}
+  - {flag: "-h, --help", description: "show help for u or one command"}
+  - {flag: "-V, --version", description: "print the u version"}
+
+exitCodes:
+  0: ok
+  1: failure or predicate false
+  2: usage
+  3: missing dependency
+  4: environment
+  5: conflict
+
+environment:
+  U_DIR: {default: "~/.application", description: "state root (bin, quick, trash)"}
+  U_DEBUG: {default: "0", description: "1 enables internal debug logging"}
+  U_TIMEOUT: {default: "60", description: "network timeout in seconds"}
+  U_CLONE_DIR: {default: "~/Documents", description: "default clone destination"}
+  U_GIT_USER: {default: "", description: "GitHub user for bare clone names"}
+  U_UPDATE_URL: {default: "", description: "override self-update and installer source"}
+  COMPOSE_FILE: {default: "", description: "compose file override"}
+  EDITOR: {default: "", description: "editor for u edit and u q edit"}
+
+commands:
+  - name: help
+    group: core
+    heavy: true
+    usage: "u help [command]"
+    summary: "show help for u or one command"
+    exits: "0 ok; 2 usage"
+  - name: version
+    group: core
+    heavy: false
+    usage: "u version"
+    summary: "print the u version"
+    exits: "0 ok; 2 usage"
+  - name: commands
+    group: core
+    heavy: false
+    usage: "u commands [--all]"
+    summary: "list commands as TSV (--all includes debug helpers)"
+    exits: "0 ok; 2 usage"
+  - name: setup
+    group: core
+    heavy: true
+    usage: "u setup [--no-rc]"
+    summary: "install u into the state bin and add it to PATH"
+    exits: "0 ok; 1 failure; 2 usage; 3 missing dependency; 4 environment; 5 conflict"
+  - name: self-update
+    group: core
+    heavy: false
+    usage: "u self-update"
+    summary: "download and install the newest u"
+    exits: "0 ok; 1 failure; 2 usage; 3 missing dependency; 4 environment; 5 conflict"
+  - name: doctor
+    group: core
+    heavy: true
+    usage: "u doctor [--strict]"
+    summary: "check platform, tools, disk and load"
+    exits: "0 ok; 1 missing required tool with --strict"
+  - name: os
+    group: core
+    heavy: true
+    usage: "u os [info|pkg|arch|is <trait>]"
+    summary: "show the platform, package manager, or test an OS trait"
+    exits: "0 ok; 1 failure; 2 usage"
+  - name: has
+    group: core
+    heavy: false
+    usage: "u has <cmd|file|dir|path|env> <name...>"
+    summary: "test for a command, file, directory, path or env var"
+    exits: "0 true; 1 false; 2 usage"
+  - name: env
+    group: core
+    heavy: false
+    usage: "u env [NAME [default]]"
+    summary: "print one env var or the u settings"
+    exits: "0 ok; 1 failure; 2 usage"
+  - name: np
+    group: core
+    heavy: true
+    usage: "u np <command> [args...]"
+    summary: "run a command with proxy variables cleared"
+    exits: "0 ok; 1 failure; 2 usage; 3 missing dependency; 4 environment; 5 conflict"
+  - name: pkg
+    group: core
+    heavy: true
+    usage: "u pkg [manager|update|upgrade|install|remove|search|clean] [args...]"
+    summary: "install, update, remove and search packages"
+    exits: "0 ok; 1 failure; 2 usage; 3 missing dependency; 4 environment; 5 conflict"
+  - name: trash
+    group: fs
+    heavy: true
+    usage: "u trash [<path...>|ls|undo <id>|rm <id>|clean [days]|empty]"
+    summary: "move files to trash, list, undo, clean"
+    exits: "0 ok; 1 failure; 2 usage; 3 missing dependency; 4 environment; 5 conflict"
+  - name: stat
+    group: fs
+    heavy: false
+    usage: "u stat [--json] [--bytes] [--epoch] <path>"
+    summary: "print size and mtime of a path"
+    exits: "0 ok; 1 failure; 2 usage"
+  - name: find
+    group: fs
+    heavy: true
+    usage: "u find [--name] [--base DIR] [--context N] [--depth N] [--hidden] <pattern> [base]"
+    summary: "search file contents or names"
+    exits: "0 ok; 1 failure; 2 usage"
+  - name: recent
+    group: fs
+    heavy: false
+    usage: "u recent [minutes] [count] [--base DIR]"
+    summary: "list recently modified files"
+    exits: "0 ok; 1 failure; 2 usage"
+  - name: zip
+    group: fs
+    heavy: false
+    usage: "u zip [--out FILE] <path...> | u zip ls <file> | u zip unzip <file> [--dest DIR]"
+    summary: "create, list or extract an archive"
+    exits: "0 ok; 1 failure; 2 usage; 3 missing dependency; 4 environment; 5 conflict"
+  - name: str
+    group: text
+    heavy: false
+    usage: "u str <eq|contains|replace|num|upper|lower|trim|len> ..."
+    summary: "string tests and transforms"
+    exits: "0 true; 1 false; 2 usage"
+  - name: date
+    group: text
+    heavy: true
+    usage: "u date [fmt [format]|epoch <time>|show <epoch> [format]|age <a> [b]|older <a> <b> [gap]]"
+    summary: "format, parse and compare dates"
+    exits: "0 success or true; 1 false; 2 usage"
+  - name: b64
+    group: text
+    heavy: false
+    usage: "u b64 [--decode] [text]"
+    summary: "base64 encode or decode"
+    exits: "0 ok; 1 failure; 2 usage"
+  - name: calc
+    group: text
+    heavy: false
+    usage: "u calc \"<expression>\""
+    summary: "evaluate an arithmetic expression"
+    exits: "0 ok; 1 failure; 2 usage"
+  - name: pw
+    group: text
+    heavy: true
+    usage: "u pw [length] [--symbols]"
+    summary: "generate a password"
+    exits: "0 ok; 1 failure; 2 usage"
+  - name: uuid
+    group: text
+    heavy: false
+    usage: "u uuid"
+    summary: "print a UUID"
+    exits: "0 ok; 1 failure; 2 usage"
+  - name: clip
+    group: text
+    heavy: false
+    usage: "u clip [text]"
+    summary: "copy stdin or arguments to the clipboard"
+    exits: "0 ok; 1 failure; 2 usage"
+  - name: ip
+    group: net
+    heavy: true
+    usage: "u ip [local|all] [-4|-6]"
+    summary: "show the public or private IP"
+    exits: "0 ok; 1 failure; 2 usage; 3 missing dependency; 4 environment; 5 conflict"
+  - name: get
+    group: net
+    heavy: true
+    usage: "u get [--head] [-o FILE] [-4|-6] <url>"
+    summary: "fetch a URL to stdout"
+    exits: "0 ok; 1 failure; 2 usage; 3 missing dependency; 4 environment; 5 conflict"
+  - name: post
+    group: net
+    heavy: false
+    usage: "u post [--form|--text|--file FILE] <url> [data]"
+    summary: "POST data to a URL"
+    exits: "0 ok; 1 failure; 2 usage; 3 missing dependency; 4 environment; 5 conflict"
+  - name: dl
+    group: net
+    heavy: true
+    usage: "u dl [-o FILE] [--github] [-4|-6] <url>"
+    summary: "download a URL to a file"
+    exits: "0 ok; 1 failure; 2 usage; 3 missing dependency; 4 environment; 5 conflict"
+  - name: dns
+    group: net
+    heavy: false
+    usage: "u dns [domain]"
+    summary: "show resolvers or resolve a name"
+    exits: "0 ok; 1 failure; 2 usage; 3 missing dependency; 4 environment; 5 conflict"
+  - name: port
+    group: proc
+    heavy: true
+    usage: "u port [<number|name>|free <number>|kill <number>]"
+    summary: "list, filter, test or kill listening ports"
+    exits: "0 success or free; 1 failure or busy; 2 usage; 3 missing dependency"
+  - name: pid
+    group: proc
+    heavy: true
+    usage: "u pid <pid|name>"
+    summary: "show a process and its parents"
+    exits: "0 ok; 1 failure; 2 usage; 3 missing dependency; 4 environment; 5 conflict"
+  - name: proc
+    group: proc
+    heavy: true
+    usage: "u proc [--cpu|--mem|<name>|kill <name|pid>]"
+    summary: "list processes by CPU or memory, or kill one"
+    exits: "0 ok; 1 failure; 2 usage; 3 missing dependency; 4 environment; 5 conflict"
+  - name: screen
+    group: proc
+    heavy: true
+    usage: "u screen [ls|new [name]|attach <name>|detach|kill [name]]"
+    summary: "start, list, attach or kill screen sessions"
+    exits: "0 ok; 1 failure; 2 usage; 3 missing dependency; 4 environment; 5 conflict"
+  - name: q
+    group: dev
+    heavy: true
+    usage: "u q [<name> [args...]|ls|add <name> [command...]|run <name>|cat <name>|edit <name>|path <name>|rm <name>]"
+    summary: "manage and run quick shell commands"
+    exits: "0 ok; 1 failure; 2 usage; 3 missing dependency; 4 environment; 5 conflict"
+  - name: clone
+    group: dev
+    heavy: true
+    usage: "u clone [--ssh] [--dir DIR] <owner/repo|url>"
+    summary: "clone a GitHub repository"
+    exits: "0 ok; 1 failure; 2 usage; 3 missing dependency; 4 environment; 5 conflict"
+  - name: g
+    group: dev
+    heavy: true
+    usage: "u g [log [n]|st|co <ref>|reset <ref>|branches]"
+    summary: "small git helpers (log, status, checkout, reset)"
+    exits: "0 ok; 1 failure; 2 usage; 3 missing dependency; 4 environment; 5 conflict"
+  - name: dk
+    group: dev
+    heavy: true
+    usage: "u dk [ps|images|stats|inspect|logs|sh|run|stop|rm|save|load|clean] [args...]"
+    summary: "thin docker helper"
+    exits: "0 ok; 1 failure; 2 usage; 3 missing dependency; 4 environment; 5 conflict"
+  - name: dc
+    group: dev
+    heavy: true
+    usage: "u dc [up|down|ps|logs|sh|exec|build|restart|stop|images] [args...]"
+    summary: "docker compose helper"
+    exits: "0 ok; 1 failure; 2 usage; 3 missing dependency; 4 environment; 5 conflict"
+  - name: svc
+    group: dev
+    heavy: true
+    usage: "u svc [ls|status|start|stop|restart|enable|disable] [name]"
+    summary: "list and control system services"
+    exits: "0 ok; 1 failure; 2 usage; 3 missing dependency; 4 environment; 5 conflict"
+  - name: open
+    group: dev
+    heavy: true
+    usage: "u open [--app NAME] <path|url>"
+    summary: "open a path or URL with the desktop"
+    exits: "0 ok; 1 failure; 2 usage; 3 missing dependency; 4 environment; 5 conflict"
+  - name: edit
+    group: dev
+    heavy: false
+    usage: "u edit [file]"
+    summary: "edit a file with $EDITOR"
+    exits: "0 ok; 1 failure; 2 usage; 3 missing dependency; 4 environment; 5 conflict"
+  - name: log
+    group: dev
+    heavy: false
+    usage: "u log [--lines N] <file> <message...>"
+    summary: "append a timestamped line with rotation"
+    exits: "0 ok; 1 failure; 2 usage; 3 missing dependency; 4 environment; 5 conflict"
+  - name: _ED
+    group: debug
+    heavy: false
+    usage: "u _ED <message...>"
+    summary: "debug log line (always prints)"
+    exits: "0 ok; 2 usage"
+  - name: _RC
+    group: debug
+    heavy: false
+    usage: "u _RC <code> [message...]"
+    summary: "exit with a code, optionally logging a message"
+    exits: "0 ok; 2 usage"
+  - name: _path
+    group: debug
+    heavy: false
+    usage: "u _path"
+    summary: "print the directory of this u"
+    exits: "0 ok; 2 usage"
+  - name: _file
+    group: debug
+    heavy: false
+    usage: "u _file"
+    summary: "print the absolute path of this u"
+    exits: "0 ok; 2 usage"
+  - name: _selftest
+    group: debug
+    heavy: false
+    usage: "u _selftest"
+    summary: "run internal assertions"
+    exits: "0 ok; 2 usage"
+  - name: _catalog
+    group: debug
+    heavy: false
+    usage: "u _catalog"
+    summary: "print the raw command catalog"
+    exits: "0 ok; 2 usage"

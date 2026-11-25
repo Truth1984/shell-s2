@@ -1,0 +1,3402 @@
+#!/usr/bin/env bash
+# shell-s2 / u: one small cross-platform CLI for daily tasks.
+# Author: Awada.Z
+# License: MIT (see LICENSE)
+#
+# Design rules
+# - bash 3.2+ (macOS /bin/bash), no associative arrays, no `local -n`.
+# - one file, one entry point: `u <command> [args...]`.
+# - stdout is the result; stderr is diagnostics; the exit code is the outcome.
+# - prompts only on a tty; `--yes` skips them.
+# - commands marked `#heavy` below are daily-use commands.
+# - commands whose name starts with `_` are debug helpers for humans and LLMs.
+#
+# Exit codes: 0 ok, 1 failure or predicate false, 2 usage, 3 missing dependency,
+# 4 environment, 5 conflict or lock.
+
+U_VERSION="2.0.0"
+U_NAME="u"
+U_REPO="Truth1984/shell-s2"
+U_BRANCH="main"
+U_RAW="https://raw.githubusercontent.com/${U_REPO}/${U_BRANCH}/u"
+
+# --- state -----------------------------------------------------------------
+# Keep the legacy state root so existing quick commands and trash survive.
+U_DIR="${U_DIR:-$HOME/.application}"
+case "$U_DIR" in
+  "~") U_DIR="$HOME" ;;
+  "~/"*) U_DIR="$HOME/${U_DIR#\~/}" ;;
+esac
+U_BIN="$U_DIR/bin"
+U_QUICK="$U_DIR/quick"
+U_TRASH="$U_DIR/.trash"
+
+U_DEBUG="${U_DEBUG:-0}"
+case "$U_DEBUG" in
+  1|true|TRUE|yes|on) U_DEBUG=1 ;;
+  *) U_DEBUG=0 ;;
+esac
+U_YES=0
+U_JSON=0
+U_CMD=""
+U_OS=""
+U_ARCH=""
+U_GNU_DATE=0
+U_PKG=""
+U_PKG_DETECTED=0
+U_TIMEOUT="${U_TIMEOUT:-60}"
+
+# --- small helpers ---------------------------------------------------------
+u_log() {
+  [ "$U_DEBUG" = 1 ] || return 0
+  printf '%s u[%s] %s\n' "$(date +"%H:%M:%S" 2>/dev/null || printf -- '--:--:--')" "$$" "$*" >&2
+}
+
+# Debug logger used inside u; silent unless U_DEBUG=1.
+_ED() {
+  u_log "$@"
+}
+
+# Debug command entry point: always prints, even when U_DEBUG is off.
+u_cmd__ED() {
+  printf 'ED %s u[%s] %s\n' "$(u_now_iso)" "$$" "$*" >&2
+  return 0
+}
+
+# Return callback: log, then exit with the given code.
+_RC() {
+  local code="${1:-0}"
+  shift || true
+  [ "$#" -gt 0 ] && u_log "$*"
+  exit "$code"
+}
+
+u_cmd__RC() {
+  local code="${1:-0}"
+  shift || true
+  [ "$#" -gt 0 ] && u_cmd__ED "$*" >&2
+  exit "$code"
+}
+
+u_die() {
+  local code="${1:-1}"
+  shift || true
+  printf 'u: %s\n' "$*" >&2
+  exit "$code"
+}
+
+u_err() {
+  printf 'u: %s\n' "$*" >&2
+}
+
+u_warn() {
+  printf 'u: warning: %s\n' "$*" >&2
+}
+
+u_has_cmd() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+u_need_cmd() {
+  u_has_cmd "$1" || u_die 3 "required command not found: $1"
+}
+
+u_expand() {
+  case "$1" in
+    "~") printf '%s\n' "$HOME" ;;
+    "~/"*) printf '%s\n' "$HOME/${1#\~/}" ;;
+    *) printf '%s\n' "$1" ;;
+  esac
+}
+
+u_abs() {
+  local p=$1
+  case "$p" in
+    /*) printf '%s\n' "$p"; return 0 ;;
+  esac
+  if [ -d "$p" ]; then
+    (cd -P "$p" 2>/dev/null && pwd)
+    return $?
+  fi
+  local d b
+  d=$(dirname "$p")
+  b=$(basename "$p")
+  (cd -P "$d" 2>/dev/null && printf '%s/%s\n' "$(pwd)" "$b")
+}
+
+u_now_iso() {
+  date +"%Y-%m-%dT%H:%M:%S%z"
+}
+
+u_scan_yes() {
+  local a
+  for a in "$@"; do
+    case "$a" in
+      --yes|-y) U_YES=1 ;;
+    esac
+  done
+}
+
+u_confirm() {
+  local prompt=$1
+  if [ "$U_YES" = 1 ]; then return 0; fi
+  if [ ! -t 0 ]; then
+    u_die 2 "$prompt (non-interactive: pass --yes)"
+  fi
+  printf '%s [y/N] ' "$prompt" >&2
+  local a=""
+  read -r a || return 1
+  case "$a" in
+    y|Y|yes|YES|Yes) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+u_choose() {
+  local prompt=$1
+  shift
+  local items=("$@")
+  local n=${#items[@]}
+  [ "$n" -gt 0 ] || return 1
+  if [ "$n" -eq 1 ]; then printf '%s\n' "${items[0]}"; return 0; fi
+  if [ ! -t 0 ]; then
+    printf '%s\n' "$prompt" >&2
+    printf '  %s\n' "${items[@]}" >&2
+    return 1
+  fi
+  printf '%s\n' "$prompt" >&2
+  local i=0
+  while [ "$i" -lt "$n" ]; do
+    printf '  [%s] %s\n' "$i" "${items[$i]}" >&2
+    i=$((i + 1))
+  done
+  printf 'choice [0]: ' >&2
+  local ans=""
+  read -r ans || return 1
+  case "$ans" in
+    "") printf '%s\n' "${items[0]}" ;;
+    *[!0-9]*) return 1 ;;
+    *)
+      [ "$ans" -lt "$n" ] || return 1
+      printf '%s\n' "${items[$ans]}"
+      ;;
+  esac
+}
+
+u_prompt() {
+  local msg=$1
+  [ -t 0 ] || return 1
+  printf '%s ' "$msg" >&2
+  local a=""
+  read -r a || return 1
+  printf '%s\n' "$a"
+}
+
+u_json_str() {
+  printf '"%s"' "$(printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')"
+}
+
+u_valid_name() {
+  case "$1" in
+    ''|.|..|-*|*[!A-Za-z0-9._-]*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+u_valid_env_name() {
+  case "$1" in
+    ''|[0-9]*|*[!A-Za-z0-9_]*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+u_ensure_dirs() {
+  [ -d "$U_DIR" ] && [ -d "$U_BIN" ] && [ -d "$U_QUICK" ] && [ -d "$U_TRASH" ] && return 0
+  mkdir -p "$U_DIR" "$U_BIN" "$U_QUICK" "$U_TRASH" 2>/dev/null ||
+    u_die 4 "cannot create state directory: $U_DIR"
+}
+
+# --- platform --------------------------------------------------------------
+u_detect() {
+  U_ARCH=$(uname -m 2>/dev/null || printf 'unknown')
+  case "$(uname -s 2>/dev/null)" in
+    Darwin) U_OS=mac ;;
+    Linux) U_OS=linux ;;
+    MINGW*|MSYS*|CYGWIN*) U_OS=windows ;;
+    *) U_OS=unknown ;;
+  esac
+  if date --version >/dev/null 2>&1; then U_GNU_DATE=1; else U_GNU_DATE=0; fi
+}
+
+u_pkg_mgr() {
+  if [ "$U_PKG_DETECTED" = 0 ]; then
+    U_PKG=""
+    case "$U_OS" in
+      mac)
+        u_has_cmd brew && U_PKG=brew
+        [ -z "$U_PKG" ] && u_has_cmd port && U_PKG=port
+        ;;
+      windows)
+        u_has_cmd choco && U_PKG=choco
+        [ -z "$U_PKG" ] && u_has_cmd winget && U_PKG=winget
+        ;;
+      *)
+        u_has_cmd apt-get && U_PKG=apt
+        [ -z "$U_PKG" ] && u_has_cmd dnf && U_PKG=dnf
+        [ -z "$U_PKG" ] && u_has_cmd yum && U_PKG=yum
+        [ -z "$U_PKG" ] && u_has_cmd pacman && U_PKG=pacman
+        [ -z "$U_PKG" ] && u_has_cmd apk && U_PKG=apk
+        [ -z "$U_PKG" ] && u_has_cmd brew && U_PKG=brew
+        ;;
+    esac
+    U_PKG_DETECTED=1
+  fi
+  printf '%s\n' "${U_PKG:-none}"
+}
+
+u_is_root() {
+  [ "$(id -u 2>/dev/null || printf '1')" = 0 ]
+}
+
+# Run a privileged command. On a non-tty, sudo must not prompt.
+u_root() {
+  if [ "$U_OS" = linux ] && ! u_is_root && u_has_cmd sudo; then
+    if [ ! -t 0 ]; then
+      sudo -n "$@" || u_die 4 "sudo requires a password (non-interactive)"
+    else
+      sudo "$@"
+    fi
+  else
+    "$@"
+  fi
+}
+
+u_sudo_cmd() {
+  if ! u_is_root && u_has_cmd sudo; then
+    if [ ! -t 0 ]; then
+      sudo -n "$@" || u_die 4 "sudo requires a password (non-interactive)"
+    else
+      sudo "$@"
+    fi
+  else
+    "$@"
+  fi
+}
+
+u_disk_pct() {
+  df -Pk "$1" 2>/dev/null | awk 'NR==2 { gsub("%", "", $5); print $5 }'
+}
+
+u_cores() {
+  if u_has_cmd nproc; then
+    nproc
+  elif [ "$U_OS" = mac ]; then
+    sysctl -n hw.ncpu 2>/dev/null || printf '1'
+  else
+    printf '1'
+  fi
+}
+
+u_load1() {
+  uptime 2>/dev/null | sed -E 's/.*load averages?: *//' | awk '{ print $1 }'
+}
+
+# --- time ------------------------------------------------------------------
+u_epoch() {
+  local s=${1:-}
+  [ -n "$s" ] || return 1
+  case "$s" in
+    now) date +%s; return 0 ;;
+  esac
+  case "$s" in
+    *[!0-9]*) ;;
+    *) printf '%s\n' "$s"; return 0 ;;
+  esac
+  local norm=$s
+  case "$norm" in
+    ????_??_??_??_??_??)
+      norm="${norm:0:4}-${norm:5:2}-${norm:8:2} ${norm:11:2}:${norm:14:2}:${norm:17:2}"
+      ;;
+  esac
+  case "$norm" in
+    *T*) norm=$(printf '%s' "$norm" | tr 'T' ' ') ;;
+  esac
+  if [ "$U_GNU_DATE" = 1 ]; then
+    date -d "$norm" +%s 2>/dev/null && return 0
+  else
+    date -j -f "%Y-%m-%d %H:%M:%S" "$norm" +%s 2>/dev/null && return 0
+    date -j -f "%Y-%m-%d" "$norm" +%s 2>/dev/null && return 0
+  fi
+  return 1
+}
+
+u_fmt_epoch() {
+  local e=$1 f=$2
+  if [ "$U_GNU_DATE" = 1 ]; then
+    date -d "@$e" +"$f"
+  else
+    date -r "$e" +"$f"
+  fi
+}
+
+u_stat_epoch() {
+  if [ "$U_OS" = mac ]; then
+    stat -f "%m" "$1" 2>/dev/null
+  else
+    stat -c "%Y" "$1" 2>/dev/null
+  fi
+}
+
+u_stat_mtime() {
+  if [ "$U_OS" = mac ]; then
+    stat -f "%Sm" -t "%Y-%m-%d %H:%M:%S" "$1" 2>/dev/null
+  else
+    stat -c "%y" "$1" 2>/dev/null | cut -d. -f1
+  fi
+}
+
+u_stat_bytes() {
+  if [ "$U_OS" = mac ]; then
+    stat -f "%z" "$1" 2>/dev/null
+  else
+    stat -c "%s" "$1" 2>/dev/null
+  fi
+}
+
+u_path_size() {
+  du -sh "$1" 2>/dev/null | awk '{ print $1 }'
+}
+
+u_shell_name() {
+  basename "${SHELL:-/bin/sh}"
+}
+
+# --- catalog, help and dispatch -------------------------------------------
+# name|group|heavy|summary
+u_catalog() {
+  cat <<'EOF'
+help|core|1|show help for u or one command
+version|core|0|print the u version
+commands|core|0|list commands as TSV (--all includes debug helpers)
+setup|core|1|install u into the state bin and add it to PATH
+self-update|core|0|download and install the newest u
+doctor|core|1|check platform, tools, disk and load
+os|core|1|show the platform, package manager, or test an OS trait
+has|core|0|test for a command, file, directory, path or env var
+env|core|0|print one env var or the u settings
+np|core|1|run a command with proxy variables cleared
+pkg|core|1|install, update, remove and search packages
+trash|fs|1|move files to trash, list, undo, clean
+stat|fs|0|print size and mtime of a path
+find|fs|1|search file contents or names
+recent|fs|0|list recently modified files
+zip|fs|0|create, list or extract an archive
+str|text|0|string tests and transforms
+date|text|1|format, parse and compare dates
+b64|text|0|base64 encode or decode
+calc|text|0|evaluate an arithmetic expression
+pw|text|1|generate a password
+uuid|text|0|print a UUID
+clip|text|0|copy stdin or arguments to the clipboard
+ip|net|1|show the public or private IP
+get|net|1|fetch a URL to stdout
+post|net|0|POST data to a URL
+dl|net|1|download a URL to a file
+dns|net|0|show resolvers or resolve a name
+port|proc|1|list, filter, test or kill listening ports
+pid|proc|1|show a process and its parents
+proc|proc|1|list processes by CPU or memory, or kill one
+screen|proc|1|start, list, attach or kill screen sessions
+q|dev|1|manage and run quick shell commands
+clone|dev|1|clone a GitHub repository
+g|dev|1|small git helpers (log, status, checkout, reset)
+dk|dev|1|thin docker helper
+dc|dev|1|docker compose helper
+svc|dev|1|list and control system services
+open|dev|1|open a path or URL with the desktop
+edit|dev|0|edit a file with $EDITOR
+log|dev|0|append a timestamped line with rotation
+_ED|debug|0|debug log line (always prints)
+_RC|debug|0|exit with a code, optionally logging a message
+_path|debug|0|print the directory of this u
+_file|debug|0|print the absolute path of this u
+_selftest|debug|0|run internal assertions
+_catalog|debug|0|print the raw command catalog
+EOF
+}
+
+u_help() {
+  local want=${1:-}
+  if [ -n "$want" ]; then
+    u_usage "$want"
+    return 0
+  fi
+  printf '%s %s - one small cross-platform CLI\n' "$U_NAME" "$U_VERSION"
+  printf 'usage: u [--debug] [--json] [--yes] <command> [args...]\n'
+  printf '       u help <command>\n'
+  printf '       u commands [--all]\n'
+  printf '\n'
+  local last="" name group heavy summary tag
+  u_catalog | while IFS='|' read -r name group heavy summary; do
+    case "$name" in
+      _*) [ "${U_HELP_ALL:-0}" = 1 ] || continue ;;
+    esac
+    if [ "$group" != "$last" ]; then
+      printf '\n%s\n' "$group"
+      last=$group
+    fi
+    tag=" "
+    [ "$heavy" = 1 ] && tag="*"
+    printf '  %s %-13s %s\n' "$tag" "$name" "$summary"
+  done
+  printf '\n* daily command. Debug helpers are hidden; use: u help --all\n'
+}
+
+#heavy
+u_cmd_help() {
+  case "${1:-}" in
+    --all|-a)
+      U_HELP_ALL=1
+      u_help
+      ;;
+    *)
+      u_help "${1:-}"
+      ;;
+  esac
+}
+
+u_usage() {
+  local cmd=$1 meta name group heavy summary
+  meta=$(u_catalog | awk -F'|' -v n="$cmd" '$1 == n { print; exit }')
+  [ -n "$meta" ] || u_die 2 "unknown command: $cmd (see: u help)"
+  name=$(printf '%s\n' "$meta" | cut -d'|' -f1)
+  group=$(printf '%s\n' "$meta" | cut -d'|' -f2)
+  heavy=$(printf '%s\n' "$meta" | cut -d'|' -f3)
+  summary=$(printf '%s\n' "$meta" | cut -d'|' -f4)
+  printf '%s [%s]%s\n%s\n\n' "$name" "$group" "$([ "$heavy" = 1 ] && printf ' (daily)')" "$summary"
+  printf 'usage:\n'
+  case "$cmd" in
+    help)
+      printf '%s\n' \
+        '  u help' \
+        '  u help <command>' \
+        '  u help --all'
+      ;;
+    version)
+      printf '%s\n' '  u version' '  u --json version'
+      ;;
+    commands)
+      printf '%s\n' '  u commands [--all]' '  u --json commands [--all]'
+      ;;
+    setup)
+      printf '%s\n' '  u setup [--no-rc]'
+      ;;
+    self-update)
+      printf '%s\n' '  u self-update'
+      ;;
+    doctor)
+      printf '%s\n' '  u doctor [--strict]' '  u --json doctor'
+      ;;
+    os)
+      printf '%s\n' \
+        '  u os                    print "<os> <arch>"' \
+        '  u os info               print OS details' \
+        '  u os pkg                print the package manager' \
+        '  u os arch               print the CPU architecture' \
+        '  u os is <trait>         exit 0 when the trait matches'
+      ;;
+    has)
+      printf '%s\n' \
+        '  u has cmd <name...>' \
+        '  u has file|dir|path <path...>' \
+        '  u has env <NAME...>'
+      ;;
+    env)
+      printf '%s\n' '  u env' '  u env NAME [default]'
+      ;;
+    np)
+      printf '%s\n' '  u np <command> [args...]'
+      ;;
+    pkg)
+      printf '%s\n' \
+        '  u pkg                         print the package manager' \
+        '  u pkg update                  refresh package indexes' \
+        '  u pkg upgrade [name...]       upgrade all, or named packages' \
+        '  u pkg install [--slim] <name...>' \
+        '  u pkg remove <name...>' \
+        '  u pkg search <name>' \
+        '  u pkg clean'
+      ;;
+    trash)
+      printf '%s\n' \
+        '  u trash <path...>             move paths to trash' \
+        '  u trash ls                    list trash entries' \
+        '  u trash undo <id...>          restore an entry' \
+        '  u trash rm <id...>            delete an entry permanently' \
+        '  u trash clean [days] [--yes]  delete entries older than days (90)' \
+        '  u trash empty --yes           delete every entry'
+      ;;
+    stat)
+      printf '%s\n' '  u stat [--json] [--bytes] [--epoch] <path>'
+      ;;
+    find)
+      printf '%s\n' \
+        '  u find <pattern> [base]' \
+        '  u find --name <pattern> [base]' \
+        '  u find --base DIR [--context N] [--depth N] [--hidden] <pattern>'
+      ;;
+    recent)
+      printf '%s\n' '  u recent [minutes] [count] [--base DIR]'
+      ;;
+    zip)
+      printf '%s\n' \
+        '  u zip [--out FILE] <path...>' \
+        '  u zip ls <file>' \
+        '  u zip unzip <file> [--dest DIR]'
+      ;;
+    str)
+      printf '%s\n' \
+        '  u str eq <a> <b>' \
+        '  u str contains <text> <needle>' \
+        '  u str replace <text> <search> <replacement>' \
+        '  u str num <text>' \
+        '  u str upper|lower|trim <text>' \
+        '  u str len <text>'
+      ;;
+    date)
+      printf '%s\n' \
+        '  u date                       ISO 8601 now' \
+        '  u date fmt [format]          now in a strftime format' \
+        '  u date epoch <time>          seconds since epoch' \
+        '  u date show <epoch> [format]' \
+        '  u date age <a> [b]           seconds from a to b (b defaults to now)' \
+        '  u date older <a> <b> [gap]   exit 0 when a is older than b by gap'
+      ;;
+    b64)
+      printf '%s\n' '  u b64 [text]' '  u b64 --decode [text]' '  printf %s text | u b64 [--decode]'
+      ;;
+    calc)
+      printf '%s\n' '  u calc "<expression>"'
+      ;;
+    pw)
+      printf '%s\n' '  u pw [length] [--symbols]'
+      ;;
+    uuid)
+      printf '%s\n' '  u uuid'
+      ;;
+    clip)
+      printf '%s\n' '  u clip [text]' '  printf %s text | u clip'
+      ;;
+    ip)
+      printf '%s\n' \
+        '  u ip                 public IPv4' \
+        '  u ip local           private IP' \
+        '  u ip --6             public IPv6' \
+        '  u ip all             public IPv4 and IPv6, one per line'
+      ;;
+    get)
+      printf '%s\n' '  u get [--head] [-o FILE] [-4|-6] <url>'
+      ;;
+    post)
+      printf '%s\n' \
+        '  u post <url> [data]' \
+        '  u post --file FILE <url>' \
+        '  u post --form|--text <url> [data]'
+      ;;
+    dl)
+      printf '%s\n' '  u dl [-o FILE] [--github] [-4|-6] <url>'
+      ;;
+    dns)
+      printf '%s\n' '  u dns' '  u dns <domain>'
+      ;;
+    port)
+      printf '%s\n' \
+        '  u port                      list listening TCP ports' \
+        '  u port <number|name>        filter the list' \
+        '  u port free <number>        exit 0 when the port is free' \
+        '  u port kill <number> [--yes]'
+      ;;
+    pid)
+      printf '%s\n' '  u pid <pid|name>'
+      ;;
+    proc)
+      printf '%s\n' \
+        '  u proc                 top 15 processes by CPU' \
+        '  u proc --mem           top 15 by memory' \
+        '  u proc <name>          filter processes' \
+        '  u proc kill <name|pid> [--yes]'
+      ;;
+    screen)
+      printf '%s\n' \
+        '  u screen                    attach, or start when none exists' \
+        '  u screen ls' \
+        '  u screen new [name]' \
+        '  u screen attach <name>' \
+        '  u screen detach' \
+        '  u screen kill [name] [--yes]'
+      ;;
+    q)
+      printf '%s\n' \
+        '  u q                       list quick commands' \
+        '  u q <name> [args...]      run one' \
+        '  u q run <name> [args...]' \
+        '  u q add <name> [command...]' \
+        '  u q cat|edit|path <name>' \
+        '  u q rm <name>'
+      ;;
+    clone)
+      printf '%s\n' '  u clone [--ssh] [--dir DIR] <owner/repo|url>'
+      ;;
+    g)
+      printf '%s\n' \
+        '  u g [log [n]]' \
+        '  u g st' \
+        '  u g co <ref>' \
+        '  u g reset <ref> [--yes]' \
+        '  u g branches'
+      ;;
+    dk)
+      printf '%s\n' \
+        '  u dk [ps]' \
+        '  u dk images|stats|inspect <name>|clean' \
+        '  u dk logs <name> [-f]' \
+        '  u dk sh <name>' \
+        '  u dk run <image> [command...]' \
+        '  u dk stop|rm <name>' \
+        '  u dk save <name> [file]' \
+        '  u dk load <file>'
+      ;;
+    dc)
+      printf '%s\n' \
+        '  u dc up|down|ps|stop|images' \
+        '  u dc logs [service] [-f]' \
+        '  u dc sh [service]' \
+        '  u dc exec <service> <command...>' \
+        '  u dc build [--no-cache]' \
+        '  u dc restart [service]'
+      ;;
+    svc)
+      printf '%s\n' \
+        '  u svc                     list services' \
+        '  u svc status <name>' \
+        '  u svc start|stop|restart|enable|disable <name>'
+      ;;
+    open)
+      printf '%s\n' '  u open <path|url>' '  u open --app <name>   (macOS only)'
+      ;;
+    edit)
+      printf '%s\n' '  u edit [file]'
+      ;;
+    log)
+      printf '%s\n' '  u log [--lines N] <file> <message...>'
+      ;;
+    _ED)
+      printf '%s\n' '  u _ED <message...>        always prints to stderr'
+      ;;
+    _RC)
+      printf '%s\n' '  u _RC <code> [message...]'
+      ;;
+    _path)
+      printf '%s\n' '  u _path'
+      ;;
+    _file)
+      printf '%s\n' '  u _file'
+      ;;
+    _selftest)
+      printf '%s\n' '  u _selftest'
+      ;;
+    _catalog)
+      printf '%s\n' '  u _catalog'
+      ;;
+    *)
+      printf '  u %s [args...]\n' "$cmd"
+      ;;
+  esac
+  printf '\nexit codes: 0 ok, 1 failure or predicate false, 2 usage, 3 missing dependency, 4 environment, 5 conflict\n'
+  printf 'examples:\n'
+  case "$cmd" in
+    trash) printf '%s\n' '  u trash ./old-report' '  u trash ls' '  u trash undo 1764050000-1234' ;;
+    find) printf '%s\n' '  u find "TODO" .' '  u find --name "*.md" ~/Documents' '  u find --context 2 "fixme" src' ;;
+    date) printf '%s\n' '  u date' '  u date epoch "2026-11-25 12:00:00"' '  u date older "2020-01-01" "2021-01-01"' ;;
+    q) printf '%s\n' '  u q add deploy "cd ~/app && git pull && make"' '  u q deploy' ;;
+    ip) printf '%s\n' '  u ip' '  u ip local' ;;
+    port) printf '%s\n' '  u port 8080' '  u port free 8080' ;;
+    *) printf '  u %s\n' "$cmd" ;;
+  esac
+}
+
+u_cmd_commands() {
+  local all=0
+  [ "${1:-}" = "--all" ] && all=1
+  local name group heavy summary flag
+  if [ "$U_JSON" = 1 ]; then
+    printf '['
+    local first=1
+    u_catalog | while IFS='|' read -r name group heavy summary; do
+      case "$name" in
+        _*) [ "$all" = 1 ] || continue ;;
+      esac
+      [ "$first" = 1 ] || printf ','
+      first=0
+      flag=false
+      [ "$heavy" = 1 ] && flag=true
+      printf '{"name":%s,"group":%s,"heavy":%s,"summary":%s}' \
+        "$(u_json_str "$name")" "$(u_json_str "$group")" "$flag" "$(u_json_str "$summary")"
+    done
+    printf ']\n'
+  else
+    u_catalog | while IFS='|' read -r name group heavy summary; do
+      case "$name" in
+        _*) [ "$all" = 1 ] || continue ;;
+      esac
+      printf '%s\t%s\t%s\t%s\n' "$name" "$group" "$heavy" "$summary"
+    done
+  fi
+}
+
+# --- core commands ---------------------------------------------------------
+u_cmd_version() {
+  if [ "$U_JSON" = 1 ]; then
+    printf '{"name":%s,"version":%s}\n' "$(u_json_str "$U_NAME")" "$(u_json_str "$U_VERSION")"
+  else
+    printf '%s\n' "$U_VERSION"
+  fi
+}
+
+u_self_path() {
+  local src="${BASH_SOURCE[0]}" dir
+  if [ -z "$src" ]; then
+    printf '%s\n' "$0"
+    return 0
+  fi
+  while [ -L "$src" ]; do
+    dir=$(cd -P "$(dirname "$src")" >/dev/null 2>&1 && pwd)
+    src=$(readlink "$src")
+    case "$src" in
+      /*) ;;
+      *) src="$dir/$src" ;;
+    esac
+  done
+  case "$src" in
+    /*) ;;
+    *) src="$(pwd)/$src" ;;
+  esac
+  printf '%s/%s\n' "$(cd -P "$(dirname "$src")" 2>/dev/null && pwd)" "$(basename "$src")"
+}
+
+u_rc_file() {
+  case "$(u_shell_name)" in
+    zsh) printf '%s\n' "$HOME/.zshrc" ;;
+    bash)
+      if [ "$U_OS" = mac ]; then
+        printf '%s\n' "$HOME/.bash_profile"
+      else
+        printf '%s\n' "$HOME/.bashrc"
+      fi
+      ;;
+    *)
+      if [ -f "$HOME/.zshrc" ]; then
+        printf '%s\n' "$HOME/.zshrc"
+      else
+        printf '%s\n' "$HOME/.bashrc"
+      fi
+      ;;
+  esac
+}
+
+#heavy
+u_cmd_setup() {
+  local no_rc=0
+  case "${1:-}" in
+    --no-rc) no_rc=1 ;;
+    "") ;;
+    *) u_die 2 "usage: u setup [--no-rc]" ;;
+  esac
+  u_ensure_dirs
+
+  local self target
+  self=$(u_self_path)
+  target="$U_BIN/u"
+  if [ "$self" != "$target" ] && ! [ "$self" -ef "$target" ]; then
+    cp -f "$self" "$target" || u_die 4 "cannot install u into $U_BIN"
+    chmod 755 "$target"
+  fi
+
+  if [ "$no_rc" = 0 ]; then
+    local rc block
+    rc=$(u_rc_file)
+    block='# >>> u >>>'
+    if [ -f "$rc" ] && grep -qF "$block" "$rc" 2>/dev/null; then
+      u_log "PATH block already present in $rc"
+    else
+      {
+        printf '\n%s\n' "$block"
+        printf 'export PATH="%s:$PATH"\n' "$U_BIN"
+        printf '%s\n' '# <<< u <<<'
+      } >>"$rc" || u_die 4 "cannot write $rc"
+      printf 'added %s to %s\n' "$U_BIN" "$rc"
+    fi
+  fi
+
+  printf 'u %s installed at %s\n' "$U_VERSION" "$target"
+  case ":$PATH:" in
+    *":$U_BIN:"*) ;;
+    *) printf 'run: export PATH="%s:$PATH"\n' "$U_BIN" ;;
+  esac
+  printf 'then: u help\n'
+}
+
+u_download_to() {
+  local url=$1 out=$2
+  if u_has_cmd curl; then
+    curl -fsSL --retry 1 --max-time 30 -o "$out" "$url"
+  elif u_has_cmd wget; then
+    wget -q -O "$out" "$url"
+  else
+    u_die 3 "curl or wget is required"
+  fi
+}
+
+u_update_urls() {
+  [ -n "${U_UPDATE_URL:-}" ] && printf '%s\n' "$U_UPDATE_URL"
+  printf '%s\n' "$U_RAW"
+  local prefix
+  for prefix in \
+    "https://fastgit.cc/" \
+    "http://gh.ddlc.top/" \
+    "http://ghfast.top/" \
+    "https://ghproxy.monkeyray.net/" \
+    "https://cdn.akaere.online/"
+  do
+    printf '%s%s\n' "$prefix" "$U_RAW"
+  done
+}
+
+u_cmd_self_update() {
+  u_ensure_dirs
+  local tmp="$U_DIR/.u.new.$$"
+  local url ok=0
+  while IFS= read -r url; do
+    [ -n "$url" ] || continue
+    u_log "trying $url"
+    if u_download_to "$url" "$tmp" 2>/dev/null && [ -s "$tmp" ]; then
+      if head -n 1 "$tmp" | grep -q '^#!/usr/bin/env bash' &&
+        grep -q '^U_VERSION=' "$tmp" &&
+        bash -n "$tmp" 2>/dev/null; then
+        ok=1
+        break
+      fi
+    fi
+  done <<EOF
+$(u_update_urls)
+EOF
+  if [ "$ok" = 0 ]; then
+    rm -f "$tmp"
+    u_die 1 "could not download a valid u from any mirror"
+  fi
+
+  local newver
+  newver=$(bash "$tmp" version 2>/dev/null || true)
+  [ -n "$newver" ] || { rm -f "$tmp"; u_die 1 "downloaded u did not report a version"; }
+  if [ "$newver" = "$U_VERSION" ]; then
+    rm -f "$tmp"
+    printf 'already at %s\n' "$U_VERSION"
+    return 0
+  fi
+
+  mkdir -p "$U_BIN"
+  cp -f "$tmp" "$U_BIN/u.new" || { rm -f "$tmp"; u_die 4 "cannot write $U_BIN"; }
+  chmod 755 "$U_BIN/u.new"
+  mv -f "$U_BIN/u.new" "$U_BIN/u"
+  rm -f "$tmp"
+  printf 'updated %s -> %s (%s/u)\n' "$U_VERSION" "$newver" "$U_BIN"
+}
+
+#heavy
+u_cmd_doctor() {
+  local strict=0
+  case "${1:-}" in
+    "") ;;
+    --strict) strict=1 ;;
+    *) u_die 2 "usage: u doctor [--strict]" ;;
+  esac
+  local home_pct root_pct load cores dep found missing=0
+  local warnings=""
+  home_pct=$(u_disk_pct "$HOME")
+  root_pct=$(u_disk_pct /)
+  load=$(u_load1)
+  cores=$(u_cores)
+
+  if [ -n "$home_pct" ] && [ "$home_pct" -ge 90 ]; then
+    warnings="${warnings}home disk ${home_pct}%>=90%;"
+  fi
+  if [ -n "$root_pct" ] && [ "$root_pct" -ge 90 ]; then
+    warnings="${warnings}root disk ${root_pct}%>=90%;"
+  fi
+  if [ -n "$load" ] && [ -n "$cores" ] && awk -v l="$load" -v c="$cores" 'BEGIN { exit !(l > c * 2) }'; then
+    warnings="${warnings}load ${load}>2x cores ${cores};"
+  fi
+
+  if [ "$U_JSON" = 1 ]; then
+    printf '{"name":%s,"version":%s,"os":%s,"arch":%s,"shell":%s,"state":%s,"deps":{' \
+      "$(u_json_str "$U_NAME")" "$(u_json_str "$U_VERSION")" "$(u_json_str "$U_OS")" \
+      "$(u_json_str "$U_ARCH")" "$(u_json_str "$(u_shell_name)")" "$(u_json_str "$U_DIR")"
+    local first=1
+    for dep in curl wget git python3 jq rg ag screen docker zip 7z lsof ss netstat; do
+      found=false
+      u_has_cmd "$dep" && found=true
+      [ "$first" = 1 ] || printf ','
+      first=0
+      printf '"%s":%s' "$dep" "$found"
+    done
+    printf '},"disk":{"root_pct":%s,"home_pct":%s},"load":{"one":%s,"cores":%s},"warnings":[' \
+      "${root_pct:-0}" "${home_pct:-0}" "${load:-0}" "${cores:-0}"
+    if [ -n "$warnings" ]; then
+      local old_ifs=$IFS
+      IFS=';'
+      local w
+      first=1
+      for w in $warnings; do
+        [ -n "$w" ] || continue
+        [ "$first" = 1 ] || printf ','
+        first=0
+        printf '%s' "$(u_json_str "$w")"
+      done
+      IFS=$old_ifs
+    fi
+    printf ']}\n'
+  else
+    printf '%s %s on %s %s (%s)\n' "$U_NAME" "$U_VERSION" "$U_OS" "$U_ARCH" "$(u_shell_name)"
+    printf 'state   %s\n' "$U_DIR"
+    printf 'deps\n'
+    for dep in curl wget git python3 jq rg ag screen docker zip 7z lsof ss netstat; do
+      if u_has_cmd "$dep"; then
+        printf '  [ok] %s\n' "$dep"
+      else
+        printf '  [--] %s\n' "$dep"
+        missing=$((missing + 1))
+      fi
+    done
+    printf 'disk    / %s%%  %s %s%%\n' "${root_pct:-?}" "$HOME" "${home_pct:-?}"
+    printf 'load    %s (%s cores)\n' "${load:-?}" "${cores:-?}"
+    if [ -n "$warnings" ]; then
+      printf 'warnings\n'
+      local old_ifs=$IFS
+      IFS=';'
+      local w
+      for w in $warnings; do
+        [ -n "$w" ] && printf '  %s\n' "$w"
+      done
+      IFS=$old_ifs
+    fi
+    printf 'missing optional tools: %s\n' "$missing"
+  fi
+
+  if [ "$strict" = 1 ]; then
+    for dep in curl git; do
+      u_has_cmd "$dep" || return 1
+    done
+  fi
+  return 0
+}
+
+#heavy
+u_os_id() {
+  if [ -r /etc/os-release ]; then
+    ( . /etc/os-release 2>/dev/null; printf '%s\n' "${ID:-}" )
+  else
+    printf '\n'
+  fi
+}
+
+u_os_is() {
+  local t=${1:-} id
+  case "$t" in
+    mac|darwin|macos|osx|apple) [ "$U_OS" = mac ] ;;
+    linux) [ "$U_OS" = linux ] ;;
+    win|windows) [ "$U_OS" = windows ] ;;
+    arm64|aarch64) [ "$U_ARCH" = arm64 ] || [ "$U_ARCH" = aarch64 ] ;;
+    x86_64|amd64|x64) [ "$U_ARCH" = x86_64 ] || [ "$U_ARCH" = amd64 ] ;;
+    brew) [ "$(u_pkg_mgr)" = brew ] ;;
+    apt|debian|ubuntu)
+      id=$(u_os_id)
+      [ "$id" = debian ] || [ "$id" = ubuntu ]
+      ;;
+    dnf|fedora|rhel|redhat)
+      id=$(u_os_id)
+      [ "$id" = fedora ] || [ "$id" = rhel ] || [ "$id" = centos ]
+      ;;
+    yum|centos)
+      id=$(u_os_id)
+      [ "$id" = centos ] || [ "$id" = rhel ]
+      ;;
+    pacman|arch|archlinux)
+      id=$(u_os_id)
+      [ "$id" = arch ] || [ "$(u_pkg_mgr)" = pacman ]
+      ;;
+    apk|alpine)
+      id=$(u_os_id)
+      [ "$id" = alpine ] || [ "$(u_pkg_mgr)" = apk ]
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+#heavy
+u_cmd_os() {
+  case "${1:-}" in
+    "")
+      printf '%s %s\n' "$U_OS" "$U_ARCH"
+      ;;
+    info)
+      printf 'os: %s\narch: %s\nshell: %s\n' "$U_OS" "$U_ARCH" "$(u_shell_name)"
+      uname -a 2>/dev/null || true
+      if [ "$U_OS" = mac ] && u_has_cmd sw_vers; then
+        sw_vers
+      elif [ "$U_OS" = linux ] && [ -r /etc/os-release ]; then
+        cat /etc/os-release
+      elif [ "$U_OS" = windows ]; then
+        cmd.exe /c ver 2>/dev/null || true
+      fi
+      ;;
+    pkg|manager)
+      u_pkg_mgr
+      ;;
+    arch)
+      printf '%s\n' "$U_ARCH"
+      ;;
+    is)
+      shift
+      [ "$#" -gt 0 ] || u_die 2 "usage: u os is <trait>"
+      u_os_is "$1"
+      ;;
+    *)
+      u_die 2 "usage: u os [info|pkg|arch|is <trait>]"
+      ;;
+  esac
+}
+
+u_cmd_has() {
+  local kind=${1:-}
+  shift || true
+  [ -n "$kind" ] && [ "$#" -gt 0 ] || u_die 2 "usage: u has <cmd|file|dir|path|env> <name...>"
+  local n missing=0
+  for n in "$@"; do
+    case "$kind" in
+      cmd)
+        if ! u_has_cmd "$n"; then
+          u_log "missing command: $n"
+          missing=$((missing + 1))
+        fi
+        ;;
+      file)
+        if [ ! -f "$n" ]; then
+          u_log "missing file: $n"
+          missing=$((missing + 1))
+        fi
+        ;;
+      dir)
+        if [ ! -d "$n" ]; then
+          u_log "missing directory: $n"
+          missing=$((missing + 1))
+        fi
+        ;;
+      path)
+        if [ ! -e "$n" ]; then
+          u_log "missing path: $n"
+          missing=$((missing + 1))
+        fi
+        ;;
+      env)
+        if ! u_valid_env_name "$n"; then
+          u_log "invalid env name: $n"
+          missing=$((missing + 1))
+        elif ! eval "[ \${$n+x} ]"; then
+          u_log "missing env: $n"
+          missing=$((missing + 1))
+        fi
+        ;;
+      *)
+        u_die 2 "unknown has kind: $kind"
+        ;;
+    esac
+  done
+  [ "$missing" -eq 0 ]
+}
+
+u_cmd_env() {
+  if [ "$#" -eq 0 ]; then
+    printf 'U_VERSION=%s\n' "$U_VERSION"
+    printf 'U_OS=%s\n' "$U_OS"
+    printf 'U_ARCH=%s\n' "$U_ARCH"
+    printf 'U_DIR=%s\n' "$U_DIR"
+    printf 'U_BIN=%s\n' "$U_BIN"
+    printf 'U_DEBUG=%s\n' "$U_DEBUG"
+    printf 'U_TIMEOUT=%s\n' "$U_TIMEOUT"
+    printf 'U_PKG=%s\n' "$(u_pkg_mgr)"
+    printf 'SHELL=%s\n' "${SHELL:-}"
+    return 0
+  fi
+  local name=$1 default=${2:-} has_default=0
+  [ "$#" -ge 2 ] && has_default=1
+  u_valid_env_name "$name" || u_die 2 "invalid env name: $name"
+  if eval "[ \${$name+x} ]"; then
+    printf '%s\n' "${!name}"
+  elif [ "$has_default" = 1 ]; then
+    printf '%s\n' "$default"
+  else
+    return 1
+  fi
+}
+
+#heavy
+u_cmd_np() {
+  [ "$#" -gt 0 ] || u_die 2 "usage: u np <command> [args...]"
+  https_proxy= http_proxy= HTTPS_PROXY= HTTP_PROXY= no_proxy= NO_PROXY= all_proxy= ALL_PROXY= "$@"
+}
+
+#heavy
+u_pkg_install() {
+  local slim=0
+  case "${1:-}" in
+    --slim) slim=1; shift ;;
+  esac
+  [ "$#" -gt 0 ] || u_die 2 "usage: u pkg install [--slim] <name...>"
+  local m
+  m=$(u_pkg_mgr)
+  case "$m" in
+    apt)
+      if [ "$slim" = 1 ]; then
+        u_root env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$@"
+      else
+        u_root env DEBIAN_FRONTEND=noninteractive apt-get install -y "$@"
+      fi
+      ;;
+    dnf) u_root dnf install -y "$@" ;;
+    yum) u_root yum install -y "$@" ;;
+    pacman) u_root pacman -Syu --noconfirm "$@" ;;
+    apk)
+      if [ "$slim" = 1 ]; then u_root apk add --no-cache "$@"; else u_root apk add "$@"; fi
+      ;;
+    brew) HOMEBREW_NO_AUTO_UPDATE=1 brew install "$@" ;;
+    port) u_sudo_cmd port install "$@" ;;
+    choco) choco install -y "$@" ;;
+    winget) winget install --accept-package-agreements --accept-source-agreements "$@" ;;
+    *) u_die 3 "no supported package manager found" ;;
+  esac
+}
+
+#heavy
+u_pkg_update() {
+  local m
+  m=$(u_pkg_mgr)
+  case "$m" in
+    apt) u_root env DEBIAN_FRONTEND=noninteractive apt-get update -y ;;
+    dnf) u_root dnf check-update || true ;;
+    yum) u_root yum check-update || true ;;
+    pacman) u_root pacman -Sy ;;
+    apk) u_root apk update ;;
+    brew) brew update ;;
+    port) u_sudo_cmd port selfupdate ;;
+    choco) u_root choco upgrade chocolatey -y ;;
+    winget) u_warn "winget refreshes sources on demand" ;;
+    *) u_die 3 "no supported package manager found" ;;
+  esac
+}
+
+#heavy
+u_pkg_upgrade() {
+  local m names=0
+  [ "$#" -gt 0 ] && names=1
+  m=$(u_pkg_mgr)
+  case "$m" in
+    apt)
+      if [ "$names" = 1 ]; then
+        u_root env DEBIAN_FRONTEND=noninteractive apt-get install --only-upgrade -y "$@"
+      else
+        u_root env DEBIAN_FRONTEND=noninteractive apt-get upgrade -y
+      fi
+      ;;
+    dnf) u_root dnf upgrade -y "$@" ;;
+    yum) u_root yum update -y "$@" ;;
+    pacman) u_root pacman -Syu --noconfirm "$@" ;;
+    apk) u_root apk upgrade "$@" ;;
+    brew) brew upgrade "$@" ;;
+    port) u_sudo_cmd port upgrade "$@" ;;
+    choco) choco upgrade -y "$@" ;;
+    winget)
+      if [ "$names" = 1 ]; then
+        winget upgrade --accept-package-agreements --accept-source-agreements "$@"
+      else
+        winget upgrade --all -y --accept-package-agreements --accept-source-agreements
+      fi
+      ;;
+    *) u_die 3 "no supported package manager found" ;;
+  esac
+}
+
+#heavy
+u_pkg_remove() {
+  [ "$#" -gt 0 ] || u_die 2 "usage: u pkg remove <name...>"
+  local m
+  m=$(u_pkg_mgr)
+  case "$m" in
+    apt) u_root env DEBIAN_FRONTEND=noninteractive apt-get autoremove -y "$@" ;;
+    dnf) u_root dnf autoremove -y "$@" ;;
+    yum) u_root yum autoremove -y "$@" ;;
+    pacman) u_root pacman -Rns --noconfirm "$@" ;;
+    apk) u_root apk del "$@" ;;
+    brew) brew uninstall "$@" ;;
+    port) u_sudo_cmd port uninstall "$@" ;;
+    choco) choco uninstall -y "$@" ;;
+    winget) winget uninstall "$@" ;;
+    *) u_die 3 "no supported package manager found" ;;
+  esac
+}
+
+u_pkg_search() {
+  [ "$#" -gt 0 ] || u_die 2 "usage: u pkg search <name>"
+  local m
+  m=$(u_pkg_mgr)
+  case "$m" in
+    apt) apt-cache search -- "$@" ;;
+    dnf) dnf search "$@" ;;
+    yum) yum search "$@" ;;
+    pacman) pacman -Ss "$@" ;;
+    apk) apk search "$@" ;;
+    brew) brew search "$@" ;;
+    port) port search "$@" ;;
+    choco) choco search "$@" ;;
+    winget) winget search "$@" ;;
+    *) u_die 3 "no supported package manager found" ;;
+  esac
+}
+
+u_pkg_clean() {
+  local m
+  m=$(u_pkg_mgr)
+  case "$m" in
+    apt)
+      u_root env DEBIAN_FRONTEND=noninteractive apt-get autoremove -y
+      u_root apt-get clean
+      ;;
+    dnf) u_root dnf clean all ;;
+    yum) u_root yum clean all ;;
+    pacman) u_root pacman -Sc --noconfirm ;;
+    apk) u_root apk cache clean ;;
+    brew) brew cleanup ;;
+    port) u_sudo_cmd port reclaim ;;
+    choco) choco cache remove -y ;;
+    winget) u_warn "winget has no cache clean" ;;
+    *) u_die 3 "no supported package manager found" ;;
+  esac
+}
+
+#heavy
+u_cmd_pkg() {
+  local a
+  for a in "$@"; do
+    case "$a" in -h|--help) u_usage pkg; return 0 ;; esac
+  done
+  local action=${1:-}
+  case "$action" in
+    "")
+      u_pkg_mgr
+      ;;
+    manager)
+      u_pkg_mgr
+      ;;
+    update|update-lists)
+      shift
+      u_pkg_update "$@"
+      ;;
+    upgrade)
+      shift
+      u_pkg_upgrade "$@"
+      ;;
+    install|add)
+      shift
+      u_pkg_install "$@"
+      ;;
+    remove|rm|uninstall)
+      shift
+      u_pkg_remove "$@"
+      ;;
+    search)
+      shift
+      u_pkg_search "$@"
+      ;;
+    clean)
+      shift
+      u_pkg_clean "$@"
+      ;;
+    *)
+      u_die 2 "usage: u pkg [manager|update|upgrade|install|remove|search|clean]"
+      ;;
+  esac
+}
+
+# --- filesystem ------------------------------------------------------------
+u_trash_read_info() {
+  local d=$1
+  if [ -f "$d/info" ]; then
+    sed -n 's/^time=//p' "$d/info" | head -n 1
+    sed -n 's/^original=//p' "$d/info" | head -n 1
+  elif [ -f "$d/_U2_TRASH_INFO" ]; then
+    sed -n 's/^dtime=//p' "$d/_U2_TRASH_INFO" | head -n 1
+    sed -n 's/^originalDir=//p' "$d/_U2_TRASH_INFO" | head -n 1
+  fi
+}
+
+u_trash_put() {
+  [ "$#" -gt 0 ] || u_die 2 "usage: u trash <path...>"
+  u_ensure_dirs
+  local p abs home_abs id n dir rc=0
+  home_abs=$(u_abs "$HOME")
+  for p in "$@"; do
+    if [ ! -e "$p" ]; then
+      u_err "not found: $p"
+      rc=1
+      continue
+    fi
+    abs=$(u_abs "$p") || {
+      u_err "cannot resolve: $p"
+      rc=1
+      continue
+    }
+    case "$abs" in
+      /|"$home_abs"|"$U_DIR"|"$U_TRASH")
+        u_err "refusing to trash a protected path: $abs"
+        rc=1
+        continue
+        ;;
+    esac
+    id="$(date +%s)-$$"
+    n=0
+    while [ -e "$U_TRASH/$id" ]; do
+      n=$((n + 1))
+      id="$(date +%s)-$$-$n"
+    done
+    dir="$U_TRASH/$id"
+    mkdir -p "$dir" || {
+      u_err "cannot create trash entry: $dir"
+      rc=1
+      continue
+    }
+    printf 'original=%s\ntime=%s\n' "$abs" "$(u_now_iso)" >"$dir/info"
+    if ! mv "$abs" "$dir/payload" 2>/dev/null; then
+      rm -rf "$dir"
+      u_err "cannot move to trash: $abs"
+      rc=1
+      continue
+    fi
+    printf '%s\t%s\n' "$id" "$abs"
+    _ED "trashed $abs as $id"
+  done
+  return "$rc"
+}
+
+u_trash_list() {
+  local d id info time orig size
+  for d in "$U_TRASH"/*; do
+    [ -d "$d" ] || continue
+    id=${d##*/}
+    info=$(u_trash_read_info "$d")
+    time=$(printf '%s\n' "$info" | sed -n '1p')
+    orig=$(printf '%s\n' "$info" | sed -n '2p')
+    size=$(u_path_size "$d")
+    [ -n "$orig" ] || continue
+    printf '%s\t%s\t%s\t%s\n' "$id" "${time:-?}" "${size:-?}" "$orig"
+  done | sort -r
+}
+
+u_trash_resolve() {
+  local want=$1 d id found="" count=0
+  for d in "$U_TRASH"/*; do
+    [ -d "$d" ] || continue
+    id=${d##*/}
+    if [ "$id" = "$want" ]; then
+      printf '%s\n' "$d"
+      return 0
+    fi
+  done
+  for d in "$U_TRASH"/*; do
+    [ -d "$d" ] || continue
+    id=${d##*/}
+    case "$id" in
+      "$want"*)
+        found="${found}${id}"$'\n'
+        count=$((count + 1))
+        ;;
+    esac
+  done
+  if [ "$count" -eq 1 ]; then
+    printf '%s\n' "$U_TRASH/${found%$'\n'}"
+    return 0
+  fi
+  if [ "$count" -gt 1 ]; then
+    u_err "ambiguous trash id: $want"
+    printf '%s' "$found" >&2
+  fi
+  return 1
+}
+
+u_trash_undo() {
+  [ "$#" -gt 0 ] || u_die 2 "usage: u trash undo <id...>"
+  local want d info time orig parent child rc=0
+  for want in "$@"; do
+    if ! d=$(u_trash_resolve "$want"); then
+      u_err "trash entry not found: $want"
+      rc=1
+      continue
+    fi
+    info=$(u_trash_read_info "$d")
+    time=$(printf '%s\n' "$info" | sed -n '1p')
+    orig=$(printf '%s\n' "$info" | sed -n '2p')
+    if [ -z "$orig" ]; then
+      u_err "trash entry has no original path: $want"
+      rc=1
+      continue
+    fi
+    if [ -e "$orig" ]; then
+      u_err "original path already exists: $orig"
+      rc=1
+      continue
+    fi
+    parent=$(dirname "$orig")
+    mkdir -p "$parent" || {
+      u_err "cannot create: $parent"
+      rc=1
+      continue
+    }
+    if [ -e "$d/payload" ]; then
+      if ! mv "$d/payload" "$orig"; then
+        u_err "cannot restore: $orig"
+        rc=1
+        continue
+      fi
+      rm -rf "$d"
+    else
+      # Legacy entry: move the children back into the original parent.
+      for child in "$d"/*; do
+        [ -e "$child" ] || continue
+        case "$child" in
+          */_U2_TRASH_INFO) continue ;;
+        esac
+        mv "$child" "$parent/" || rc=1
+      done
+      rm -rf "$d"
+    fi
+    printf 'restored\t%s\n' "$orig"
+  done
+  return "$rc"
+}
+
+u_trash_rm() {
+  [ "$#" -gt 0 ] || u_die 2 "usage: u trash rm <id...>"
+  local want d rc=0
+  for want in "$@"; do
+    if ! d=$(u_trash_resolve "$want"); then
+      u_err "trash entry not found: $want"
+      rc=1
+      continue
+    fi
+    rm -rf "$d" && printf 'removed\t%s\n' "${d##*/}"
+  done
+  return "$rc"
+}
+
+u_trash_empty() {
+  u_confirm "delete every entry in $U_TRASH?" || return 1
+  find "$U_TRASH" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null
+  printf 'trash emptied\n'
+}
+
+u_trash_clean() {
+  local days=${1:-90}
+  case "$days" in
+    ''|*[!0-9]*) u_die 2 "days must be a number: $days" ;;
+  esac
+  local now limit d id info time epoch age target=""
+  now=$(date +%s)
+  limit=$((days * 86400))
+  for d in "$U_TRASH"/*; do
+    [ -d "$d" ] || continue
+    id=${d##*/}
+    info=$(u_trash_read_info "$d")
+    time=$(printf '%s\n' "$info" | sed -n '1p')
+    [ -n "$time" ] || continue
+    epoch=$(u_epoch "$time" 2>/dev/null) || continue
+    age=$((now - epoch))
+    if [ "$age" -ge "$limit" ]; then
+      target="${target}${id}"$'\n'
+    fi
+  done
+  if [ -z "$target" ]; then
+    printf 'nothing older than %s days\n' "$days"
+    return 0
+  fi
+  printf '%s' "$target"
+  u_confirm "delete the entries listed above?" || return 1
+  local old_ifs=$IFS
+  IFS=$'\n'
+  for id in $target; do
+    [ -n "$id" ] && rm -rf "$U_TRASH/$id"
+  done
+  IFS=$old_ifs
+  printf 'cleaned\n'
+}
+
+#heavy
+u_cmd_trash() {
+  local argv=() a
+  for a in "$@"; do
+    case "$a" in
+      --yes|-y) U_YES=1 ;;
+      *) argv+=("$a") ;;
+    esac
+  done
+  set -- "${argv[@]}"
+  case "${1:-}" in
+    "")
+      u_die 2 "usage: u trash <path...> | ls | undo <id> | rm <id> | clean [days] | empty"
+      ;;
+    ls|list)
+      u_trash_list
+      ;;
+    undo|restore)
+      shift
+      u_trash_undo "$@"
+      ;;
+    rm|delete)
+      shift
+      u_trash_rm "$@"
+      ;;
+    empty|purge)
+      u_trash_empty
+      ;;
+    clean)
+      shift
+      u_trash_clean "$@"
+      ;;
+    *)
+      u_trash_put "$@"
+      ;;
+  esac
+}
+
+u_cmd_stat() {
+  local json=0 bytes=0 epoch=0 path="" a
+  for a in "$@"; do
+    case "$a" in
+      --json) json=1 ;;
+      --bytes) bytes=1 ;;
+      --epoch) epoch=1 ;;
+      -*) u_die 2 "unknown option: $a" ;;
+      *) path=$a ;;
+    esac
+  done
+  [ -n "$path" ] || u_die 2 "usage: u stat [--json] [--bytes] [--epoch] <path>"
+  [ -e "$path" ] || u_die 1 "not found: $path"
+  local size bytes_n mtime epoch_n
+  size=$(u_path_size "$path")
+  bytes_n=$(u_stat_bytes "$path")
+  mtime=$(u_stat_mtime "$path")
+  epoch_n=$(u_stat_epoch "$path")
+  if [ "$json" = 1 ]; then
+    printf '{"path":%s,"size":%s,"bytes":%s,"mtime":%s,"epoch":%s}\n' \
+      "$(u_json_str "$path")" "$(u_json_str "$size")" "${bytes_n:-0}" \
+      "$(u_json_str "$mtime")" "${epoch_n:-0}"
+  elif [ "$bytes" = 1 ]; then
+    printf '%s\n' "${bytes_n:-0}"
+  elif [ "$epoch" = 1 ]; then
+    printf '%s\n' "${epoch_n:-0}"
+  else
+    printf '%s\t%s\t%s\n' "${size:-?}" "${mtime:-?}" "$path"
+  fi
+}
+
+#heavy
+u_cmd_find() {
+  local mode=content base="" ctx="" depth="" hidden=0 a
+  local args=()
+  while [ "$#" -gt 0 ]; do
+    a=$1
+    case "$a" in
+      --name) mode=name ;;
+      --base)
+        shift
+        base=${1:-}
+        [ -n "$base" ] || u_die 2 "--base needs a directory"
+        ;;
+      --context|-C)
+        shift
+        ctx=${1:-}
+        [ -n "$ctx" ] || u_die 2 "$a needs a number"
+        ;;
+      --depth)
+        shift
+        depth=${1:-}
+        [ -n "$depth" ] || u_die 2 "--depth needs a number"
+        ;;
+      --hidden) hidden=1 ;;
+      -*) u_die 2 "unknown option: $a" ;;
+      *) args+=("$a") ;;
+    esac
+    shift
+  done
+  local pat=${args[0]:-}
+  [ -n "$pat" ] || u_die 2 "usage: u find [--name] [--base DIR] <pattern> [base]"
+  [ -z "$base" ] && base=${args[1]:-.}
+  local base_is_file=0
+  if [ -f "$base" ]; then
+    base_is_file=1
+  elif [ ! -d "$base" ]; then
+    u_die 1 "not a file or directory: $base"
+  fi
+
+  if [ "$mode" = name ]; then
+    if [ "$base_is_file" = 1 ]; then
+      case "$(basename "$base")" in
+        *"$pat"*) printf '%s\n' "$base"; return 0 ;;
+        *) return 1 ;;
+      esac
+    fi
+    local -a cmd=(find "$base")
+    if [ "$hidden" = 0 ]; then
+      cmd+=(-name '.?*' -prune -o)
+    fi
+    cmd+=(-path "$base/.git" -prune -o -path "$base/node_modules" -prune -o -type f -name "*$pat*" -print)
+    [ -n "$depth" ] && u_warn "--depth is not supported with --name; ignored"
+    local out
+    out=$("${cmd[@]}" 2>/dev/null)
+    [ -n "$out" ] && printf '%s\n' "$out"
+    [ -n "$out" ]
+    return
+  fi
+
+  if [ "$base_is_file" = 1 ]; then
+    if u_has_cmd rg; then
+      local -a cmd=(rg -n --no-heading --color never)
+      [ -n "$ctx" ] && cmd+=(-C "$ctx")
+      cmd+=(-- "$pat" "$base")
+      "${cmd[@]}"
+    elif u_has_cmd ag; then
+      local -a cmd=(ag -n --nogroup --column --nocolor)
+      [ -n "$ctx" ] && cmd+=(--context "$ctx")
+      cmd+=(-- "$pat" "$base")
+      "${cmd[@]}"
+    else
+      local -a cmd=(grep -n --binary-files=without-match)
+      [ -n "$ctx" ] && cmd+=(-C "$ctx")
+      cmd+=(-E -- "$pat" "$base")
+      "${cmd[@]}"
+    fi
+    return
+  fi
+
+  if u_has_cmd rg; then
+    local -a cmd=(rg -n --no-heading --color never)
+    [ "$hidden" = 1 ] && cmd+=(--hidden)
+    [ -n "$ctx" ] && cmd+=(-C "$ctx")
+    [ -n "$depth" ] && cmd+=(--max-depth "$depth")
+    cmd+=(-g '!node_modules' -g '!.git' -- "$pat" "$base")
+    "${cmd[@]}"
+  elif u_has_cmd ag; then
+    local -a cmd=(ag -n --nogroup --column --nocolor)
+    [ "$hidden" = 1 ] && cmd+=(--hidden)
+    [ -n "$ctx" ] && cmd+=(--context "$ctx")
+    [ -n "$depth" ] && cmd+=(--depth "$depth")
+    cmd+=(--ignore node_modules --ignore .git -- "$pat" "$base")
+    "${cmd[@]}"
+  else
+    local -a cmd=(grep -rn --binary-files=without-match --exclude-dir=.git --exclude-dir=node_modules)
+    [ -n "$ctx" ] && cmd+=(-C "$ctx")
+    cmd+=(-E -- "$pat" "$base")
+    "${cmd[@]}"
+  fi
+}
+
+u_cmd_recent() {
+  local minutes="" count="" base="." a n=0
+  while [ "$#" -gt 0 ]; do
+    a=$1
+    case "$a" in
+      --base)
+        shift
+        base=${1:-}
+        [ -n "$base" ] || u_die 2 "--base needs a directory"
+        ;;
+      --minutes)
+        shift
+        minutes=${1:-}
+        ;;
+      --count)
+        shift
+        count=${1:-}
+        ;;
+      -*) u_die 2 "unknown option: $a" ;;
+      *)
+        n=$((n + 1))
+        if [ "$n" -eq 1 ]; then
+          minutes=$a
+        elif [ "$n" -eq 2 ]; then
+          count=$a
+        else
+          u_die 2 "too many arguments"
+        fi
+        ;;
+    esac
+    shift
+  done
+  [ -n "$minutes" ] || minutes=30
+  [ -n "$count" ] || count=20
+  case "$minutes" in *[!0-9]*) u_die 2 "minutes must be a number: $minutes" ;; esac
+  case "$count" in *[!0-9]*) u_die 2 "count must be a number: $count" ;; esac
+  [ -d "$base" ] || u_die 1 "not a directory: $base"
+
+  local lines
+  if [ "$U_OS" = mac ]; then
+    lines=$(find "$base" \( -name .git -o -name node_modules \) -prune -o -type f -mmin -"$minutes" -exec stat -f '%m %N' {} + 2>/dev/null)
+  else
+    lines=$(find "$base" \( -name .git -o -name node_modules \) -prune -o -type f -mmin -"$minutes" -exec stat -c '%Y %n' {} + 2>/dev/null)
+  fi
+  [ -n "$lines" ] || return 1
+  printf '%s\n' "$lines" | sort -rn | head -n "$count" | while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    local ts path
+    ts=${line%% *}
+    path=${line#* }
+    printf '%s\t%s\n' "$(u_fmt_epoch "$ts" '%Y-%m-%d %H:%M:%S')" "$path"
+  done
+}
+
+u_7z() {
+  local z
+  for z in 7z 7za 7zz; do
+    if u_has_cmd "$z"; then
+      printf '%s\n' "$z"
+      return 0
+    fi
+  done
+  return 1
+}
+
+u_cmd_zip() {
+  local action=create out="" dest="" file="" a
+  local targets=()
+  while [ "$#" -gt 0 ]; do
+    a=$1
+    case "$a" in
+      ls|list) action=list ;;
+      unzip|extract|x) action=extract ;;
+      --out|-o)
+        shift
+        out=${1:-}
+        [ -n "$out" ] || u_die 2 "--out needs a file"
+        ;;
+      --dest|-d)
+        shift
+        dest=${1:-}
+        [ -n "$dest" ] || u_die 2 "--dest needs a directory"
+        ;;
+      -*) u_die 2 "unknown option: $a" ;;
+      *)
+        if [ "$action" = list ] && [ -z "$file" ]; then
+          file=$a
+        elif [ "$action" = extract ] && [ -z "$file" ]; then
+          file=$a
+        else
+          targets+=("$a")
+        fi
+        ;;
+    esac
+    shift
+  done
+
+  local z
+  if [ "$action" = list ]; then
+    [ -n "$file" ] || u_die 2 "usage: u zip ls <file>"
+    [ -f "$file" ] || u_die 1 "not found: $file"
+    if z=$(u_7z); then "$z" l "$file"; elif u_has_cmd unzip; then unzip -l "$file"; else u_die 3 "7z or unzip is required"; fi
+    return
+  fi
+
+  if [ "$action" = extract ]; then
+    [ -n "$file" ] || u_die 2 "usage: u zip unzip <file> [--dest DIR]"
+    [ -f "$file" ] || u_die 1 "not found: $file"
+    [ -n "$dest" ] || dest="${file%.*}"
+    [ "$dest" = "$file" ] && dest="${file}_unzip"
+    mkdir -p "$dest" || u_die 4 "cannot create: $dest"
+    if z=$(u_7z); then
+      "$z" x -y -bso0 -bsp0 -o"$dest" "$file"
+    elif u_has_cmd unzip; then
+      unzip -o "$file" -d "$dest"
+    else
+      u_die 3 "7z or unzip is required"
+    fi
+    printf 'extracted to %s\n' "$dest"
+    return
+  fi
+
+  [ "${#targets[@]}" -gt 0 ] || u_die 2 "usage: u zip [--out FILE] <path...>"
+  [ -n "$out" ] || out="$(u_fmt_epoch "$(date +%s)" '%Y_%m_%d_%H_%M_%S').zip"
+  if z=$(u_7z); then
+    "$z" a -y -bso0 -bsp0 "$out" "${targets[@]}"
+  elif u_has_cmd zip; then
+    zip -r -y "$out" "${targets[@]}"
+  else
+    u_die 3 "7z or zip is required"
+  fi
+  printf '%s\n' "$out"
+}
+
+# --- text and data ---------------------------------------------------------
+u_cmd_str() {
+  local op=${1:-}
+  shift || true
+  case "$op" in
+    eq)
+      [ "$#" -eq 2 ] || u_die 2 "usage: u str eq <a> <b>"
+      [ "$1" = "$2" ]
+      ;;
+    contains)
+      [ "$#" -eq 2 ] || u_die 2 "usage: u str contains <text> <needle>"
+      case "$1" in
+        *"$2"*) return 0 ;;
+        *) return 1 ;;
+      esac
+      ;;
+    replace)
+      [ "$#" -eq 3 ] || u_die 2 "usage: u str replace <text> <search> <replacement>"
+      [ -n "$2" ] || u_die 2 "search text must not be empty"
+      printf '%s\n' "${1//$2/$3}"
+      ;;
+    num)
+      [ "$#" -eq 1 ] || u_die 2 "usage: u str num <text>"
+      case "$1" in
+        ''|*[!0-9]*) return 1 ;;
+        *) return 0 ;;
+      esac
+      ;;
+    upper)
+      [ "$#" -ge 1 ] || u_die 2 "usage: u str upper <text>"
+      printf '%s\n' "$*" | tr '[:lower:]' '[:upper:]'
+      ;;
+    lower)
+      [ "$#" -ge 1 ] || u_die 2 "usage: u str lower <text>"
+      printf '%s\n' "$*" | tr '[:upper:]' '[:lower:]'
+      ;;
+    trim)
+      [ "$#" -ge 1 ] || u_die 2 "usage: u str trim <text>"
+      printf '%s\n' "$*" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
+      ;;
+    len)
+      [ "$#" -ge 1 ] || u_die 2 "usage: u str len <text>"
+      printf '%s\n' "${#1}"
+      ;;
+    *)
+      u_die 2 "usage: u str <eq|contains|replace|num|upper|lower|trim|len> ..."
+      ;;
+  esac
+}
+
+#heavy
+u_cmd_date() {
+  local sub=${1:-}
+  case "$sub" in
+    "")
+      u_now_iso
+      ;;
+    fmt)
+      shift
+      local fmt=${1:-"%Y-%m-%dT%H:%M:%S%z"}
+      u_fmt_epoch "$(date +%s)" "$fmt"
+      ;;
+    epoch)
+      shift
+      [ "$#" -ge 1 ] || u_die 2 "usage: u date epoch <time>"
+      u_epoch "$1" || u_die 2 "cannot parse time: $1"
+      ;;
+    show)
+      shift
+      [ "$#" -ge 1 ] || u_die 2 "usage: u date show <epoch> [format]"
+      case "$1" in *[!0-9]*) u_die 2 "epoch must be a number: $1" ;; esac
+      u_fmt_epoch "$1" "${2:-"%Y-%m-%dT%H:%M:%S%z"}"
+      ;;
+    age)
+      shift
+      [ "$#" -ge 1 ] || u_die 2 "usage: u date age <a> [b]"
+      local a b
+      a=$(u_epoch "$1") || u_die 2 "cannot parse time: $1"
+      b=$(u_epoch "${2:-now}") || u_die 2 "cannot parse time: ${2:-now}"
+      printf '%s\n' "$((b - a))"
+      ;;
+    older)
+      shift
+      [ "$#" -ge 2 ] || u_die 2 "usage: u date older <a> <b> [gap]"
+      local a b gap=0
+      a=$(u_epoch "$1") || u_die 2 "cannot parse time: $1"
+      b=$(u_epoch "$2") || u_die 2 "cannot parse time: $2"
+      [ "$#" -ge 3 ] && gap=$3
+      case "$gap" in *[!0-9]*) u_die 2 "gap must be a number: $gap" ;; esac
+      local age=$((b - a))
+      [ "$age" -gt "$gap" ]
+      ;;
+    *)
+      u_die 2 "usage: u date [fmt|epoch|show|age|older] ..."
+      ;;
+  esac
+}
+
+u_b64_read() {
+  if [ "$#" -gt 0 ]; then
+    printf '%s' "$*"
+  elif [ ! -t 0 ]; then
+    cat
+  else
+    return 1
+  fi
+}
+
+u_b64_decode() {
+  if [ "$U_OS" = mac ]; then
+    base64 -D
+  else
+    base64 -d 2>/dev/null || base64 -D
+  fi
+}
+
+u_cmd_b64() {
+  local decode=0
+  case "${1:-}" in
+    --decode|-d) decode=1; shift ;;
+  esac
+  if [ "$#" -eq 0 ] && [ -t 0 ]; then
+    u_die 2 "usage: u b64 [--decode] [text]  (or pipe text in)"
+  fi
+  if [ "$decode" = 1 ]; then
+    u_b64_read "$@" | u_b64_decode
+  else
+    u_b64_read "$@" | base64 | tr -d '\n'
+    printf '\n'
+  fi
+}
+
+u_cmd_calc() {
+  [ "$#" -gt 0 ] || u_die 2 "usage: u calc \"<expression>\""
+  local expr="$*"
+  [ -n "$expr" ] || u_die 2 "expression is empty"
+  local bad
+  bad=$(printf '%s' "$expr" | tr -d '0-9. +*/%^()-')
+  [ -z "$bad" ] || u_die 2 "unsupported characters in expression: $bad"
+  if u_has_cmd bc; then
+    printf 'scale=10; %s\n' "$expr" | bc | sed -e 's/^\./0./' -e '/\./ s/0*$//' -e 's/\.$//'
+  else
+    awk "BEGIN { print ($expr) }"
+  fi
+}
+
+#heavy
+u_cmd_pw() {
+  local len=${1:-16} symbols=0
+  case "${2:-}" in
+    --symbols|-s) symbols=1 ;;
+  esac
+  case "$len" in *[!0-9]*) u_die 2 "length must be a number: $len" ;; esac
+  [ "$len" -ge 1 ] && [ "$len" -le 256 ] || u_die 2 "length must be 1..256"
+  local chars='A-Za-z0-9'
+  [ "$symbols" = 1 ] && chars='A-Za-z0-9!@#$%^&*()-_=+'
+  LC_ALL=C tr -dc "$chars" </dev/urandom | head -c "$len"
+  printf '\n'
+}
+
+u_cmd_uuid() {
+  if [ -r /proc/sys/kernel/random/uuid ]; then
+    cat /proc/sys/kernel/random/uuid
+  elif u_has_cmd uuidgen; then
+    uuidgen | tr 'A-Z' 'a-z'
+  else
+    printf '%04x%04x-%04x-4%03x-%04x-%04x%04x%04x\n' \
+      "$RANDOM" "$RANDOM" "$RANDOM" "$((RANDOM % 4096))" \
+      "$((RANDOM % 4096))" "$RANDOM" "$RANDOM" "$RANDOM"
+  fi
+}
+
+u_cmd_clip() {
+  local input
+  if [ "$#" -gt 0 ]; then
+    input="$*"
+  elif [ ! -t 0 ]; then
+    input=$(cat)
+  else
+    u_die 2 "usage: u clip [text] (or pipe text in)"
+  fi
+  if [ "$U_OS" = mac ]; then
+    printf '%s' "$input" | pbcopy
+  elif [ "$U_OS" = windows ]; then
+    printf '%s' "$input" | clip.exe
+  elif u_has_cmd wl-copy; then
+    printf '%s' "$input" | wl-copy
+  elif u_has_cmd xclip; then
+    printf '%s' "$input" | xclip -selection clipboard
+  elif u_has_cmd xsel; then
+    printf '%s' "$input" | xsel --clipboard --input
+  else
+    u_die 3 "no clipboard command found"
+  fi
+}
+
+# --- network ---------------------------------------------------------------
+u_public_ip() {
+  local fam=$1 url ip
+  local urls
+  if [ "$fam" = 6 ]; then
+    urls="https://ipv6.icanhazip.com https://api6.ipify.org https://ifconfig.co/ip"
+  else
+    urls="https://ipv4.icanhazip.com https://api.ipify.org https://ifconfig.me/ip https://ident.me"
+  fi
+  for url in $urls; do
+    if u_has_cmd curl; then
+      ip=$(curl "-$fam" -fsS --max-time 6 "$url" 2>/dev/null | tr -d '[:space:]')
+    elif u_has_cmd wget; then
+      ip=$(wget -qO- --timeout=6 "$url" 2>/dev/null | tr -d '[:space:]')
+    else
+      return 1
+    fi
+    [ -n "$ip" ] && { printf '%s\n' "$ip"; return 0; }
+  done
+  return 1
+}
+
+u_private_ip() {
+  local ip="" i
+  case "$U_OS" in
+    mac)
+      for i in en0 en1 en2; do
+        ip=$(ipconfig getifaddr "$i" 2>/dev/null)
+        [ -n "$ip" ] && break
+      done
+      if [ -z "$ip" ] && u_has_cmd route; then
+        i=$(route -n get default 2>/dev/null | awk '/interface:/{print $2; exit}')
+        [ -n "$i" ] && ip=$(ipconfig getifaddr "$i" 2>/dev/null)
+      fi
+      ;;
+    linux)
+      if u_has_cmd hostname; then
+        ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+      fi
+      if [ -z "$ip" ] && u_has_cmd ip; then
+        ip=$(ip route get 1.1.1.1 2>/dev/null | awk '{for (i=1; i<=NF; i++) if ($i == "src") { print $(i+1); exit }}')
+      fi
+      ;;
+    windows)
+      ip=$(ipconfig 2>/dev/null | tr -d '\r' | awk '/IPv4 Address|IPv4 地址/ {print $NF; exit}')
+      ;;
+  esac
+  [ -n "$ip" ] || return 1
+  printf '%s\n' "$ip"
+}
+
+#heavy
+u_cmd_ip() {
+  local mode=public fam=4 rc=0
+  local a
+  for a in "$@"; do
+    case "$a" in
+      local|private|lan) mode=local ;;
+      --6|-6) fam=6 ;;
+      --4|-4) fam=4 ;;
+      all)
+        mode=all
+        ;;
+      *) u_die 2 "usage: u ip [local|all] [-4|-6]" ;;
+    esac
+  done
+  case "$mode" in
+    local)
+      u_private_ip || u_die 1 "could not determine a private IP"
+      ;;
+    all)
+      local got=0
+      u_public_ip 4 && got=1
+      u_public_ip 6 && got=1
+      [ "$got" = 1 ] || rc=1
+      return "$rc"
+      ;;
+    *)
+      u_public_ip "$fam" || u_die 1 "could not determine the public IPv$fam"
+      ;;
+  esac
+}
+
+#heavy
+u_cmd_get() {
+  local head=0 out="" fam="" url="" a
+  while [ "$#" -gt 0 ]; do
+    a=$1
+    case "$a" in
+      --head|-I) head=1 ;;
+      -o)
+        shift
+        out=${1:-}
+        [ -n "$out" ] || u_die 2 "-o needs a file"
+        ;;
+      -4) fam=4 ;;
+      -6) fam=6 ;;
+      -*) u_die 2 "unknown option: $a" ;;
+      *) url=$a ;;
+    esac
+    shift
+  done
+  [ -n "$url" ] || u_die 2 "usage: u get [--head] [-o FILE] [-4|-6] <url>"
+  if u_has_cmd curl; then
+    local -a cmd=(curl -fsSL --max-time "$U_TIMEOUT")
+    [ -n "$fam" ] && cmd+=("-$fam")
+    [ "$head" = 1 ] && cmd+=(-I)
+    [ -n "$out" ] && cmd+=(-o "$out")
+    cmd+=("$url")
+    "${cmd[@]}"
+  elif u_has_cmd wget; then
+    [ "$head" = 1 ] && u_warn "--head needs curl; using a normal GET"
+    if [ -n "$out" ]; then
+      wget -q -O "$out" "$url"
+    else
+      wget -qO- "$url"
+    fi
+  else
+    u_die 3 "curl or wget is required"
+  fi
+}
+
+u_cmd_post() {
+  local ctype="application/json" data="" file="" url="" a
+  while [ "$#" -gt 0 ]; do
+    a=$1
+    case "$a" in
+      --form) ctype="application/x-www-form-urlencoded" ;;
+      --text) ctype="text/plain" ;;
+      --file)
+        shift
+        file=${1:-}
+        [ -n "$file" ] || u_die 2 "--file needs a path"
+        ;;
+      -*) u_die 2 "unknown option: $a" ;;
+      *)
+        if [ -z "$url" ]; then
+          url=$a
+        else
+          data="$data $a"
+        fi
+        ;;
+    esac
+    shift
+  done
+  [ -n "$url" ] || u_die 2 "usage: u post [--form|--text|--file FILE] <url> [data]"
+  u_has_cmd curl || u_die 3 "curl is required"
+  local -a cmd=(curl -fsSL --max-time "$U_TIMEOUT" -X POST -H "Content-Type: $ctype")
+  if [ -n "$file" ]; then
+    [ -f "$file" ] || u_die 1 "not found: $file"
+    cmd+=(--data-binary "@$file")
+  elif [ -n "$data" ]; then
+    cmd+=(--data-binary "${data# }")
+  else
+    cmd+=(--data-binary "")
+  fi
+  cmd+=("$url")
+  "${cmd[@]}"
+}
+
+u_download_file() {
+  local url=$1 out=$2 fam=$3
+  if u_has_cmd curl; then
+    local -a cmd=(curl -fsSL --retry 2 --max-time 300)
+    [ -n "$fam" ] && cmd+=("-$fam")
+    cmd+=(-o "$out" "$url")
+    "${cmd[@]}"
+  elif u_has_cmd wget; then
+    wget -q -O "$out" "$url"
+  else
+    u_die 3 "curl or wget is required"
+  fi
+}
+
+#heavy
+u_cmd_dl() {
+  local github=0 out="" fam="" url="" a
+  while [ "$#" -gt 0 ]; do
+    a=$1
+    case "$a" in
+      --github) github=1 ;;
+      -o)
+        shift
+        out=${1:-}
+        [ -n "$out" ] || u_die 2 "-o needs a file"
+        ;;
+      -4) fam=4 ;;
+      -6) fam=6 ;;
+      -*) u_die 2 "unknown option: $a" ;;
+      *) url=$a ;;
+    esac
+    shift
+  done
+  [ -n "$url" ] || u_die 2 "usage: u dl [-o FILE] [--github] [-4|-6] <url>"
+  if [ -z "$out" ]; then
+    out=${url%%\?*}
+    out=${out##*/}
+    [ -n "$out" ] || out="download"
+  fi
+  if [ "$github" = 1 ]; then
+    local prefix
+    for prefix in "https://fastgit.cc/" "https://gh.ddlc.top/" "http://ghfast.top/" "https://ghproxy.monkeyray.net/" "https://cdn.akaere.online/" ""; do
+      _ED "download via ${prefix:-direct}"
+      if u_download_file "${prefix}${url}" "$out" "$fam"; then
+        [ -s "$out" ] && { printf '%s\n' "$out"; return 0; }
+      fi
+      rm -f "$out"
+    done
+    u_die 1 "download failed: $url"
+  fi
+  u_download_file "$url" "$out" "$fam" || u_die 1 "download failed: $url"
+  printf '%s\n' "$out"
+}
+
+u_cmd_dns() {
+  if [ "$#" -eq 0 ]; then
+    case "$U_OS" in
+      mac) scutil --dns 2>/dev/null | awk '/nameserver\[[0-9]+\]/{print $3}' | sort -u ;;
+      linux)
+        if u_has_cmd resolvectl; then
+          resolvectl dns 2>/dev/null
+        else
+          awk '/^nameserver/{print $2}' /etc/resolv.conf 2>/dev/null
+        fi
+        ;;
+      windows) ipconfig /all 2>/dev/null | tr -d '\r' | grep -i -A1 'DNS Servers' ;;
+      *) cat /etc/resolv.conf 2>/dev/null ;;
+    esac
+    return
+  fi
+  local domain=$1
+  [ -n "$domain" ] || u_die 2 "usage: u dns <domain>"
+  case "$U_OS" in
+    mac) dscacheutil -q host -a name "$domain" 2>/dev/null | awk '/ip_address/{print $2}' ;;
+    linux) getent hosts "$domain" 2>/dev/null | awk '{print $1}' ;;
+    *) nslookup "$domain" 2>/dev/null | awk '/^Address: /{print $2}' ;;
+  esac
+}
+
+# --- processes and sessions ------------------------------------------------
+u_port_list() {
+  case "$U_OS" in
+    mac)
+      lsof -nP -iTCP -sTCP:LISTEN
+      ;;
+    linux)
+      if u_has_cmd ss; then
+        ss -ltnp
+      elif u_has_cmd netstat; then
+        netstat -ltnp
+      elif u_has_cmd lsof; then
+        lsof -nP -iTCP -sTCP:LISTEN
+      else
+        u_die 3 "ss, netstat or lsof is required"
+      fi
+      ;;
+    windows)
+      netstat -ano
+      ;;
+    *)
+      u_die 3 "unsupported platform for port listing"
+      ;;
+  esac
+}
+
+u_port_busy() {
+  local n=$1
+  if u_has_cmd lsof; then
+    lsof -nP -iTCP:"$n" -sTCP:LISTEN >/dev/null 2>&1 && return 0
+    return 1
+  fi
+  (exec 3<>"/dev/tcp/127.0.0.1/$n") 2>/dev/null && return 0
+  return 1
+}
+
+u_port_pid() {
+  local n=$1
+  case "$U_OS" in
+    mac)
+      lsof -nP -iTCP:"$n" -sTCP:LISTEN 2>/dev/null | awk 'NR > 1 { print $2; exit }'
+      ;;
+    linux)
+      if u_has_cmd ss; then
+        ss -ltnp 2>/dev/null | grep -F ":$n " | sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' | head -n 1
+      elif u_has_cmd fuser; then
+        fuser -n tcp "$n" 2>/dev/null | awk '{print $1; exit}'
+      fi
+      ;;
+    windows)
+      netstat -ano 2>/dev/null | grep -F ":$n " | awk '$4 == "LISTENING" { print $5; exit }'
+      ;;
+  esac
+}
+
+#heavy
+u_cmd_port() {
+  local argv=() a
+  for a in "$@"; do
+    case "$a" in
+      --yes|-y) U_YES=1 ;;
+      *) argv+=("$a") ;;
+    esac
+  done
+  set -- "${argv[@]}"
+  local sub=${1:-}
+  case "$sub" in
+    ""|list|ls)
+      u_port_list
+      ;;
+    free)
+      shift
+      [ "$#" -ge 1 ] || u_die 2 "usage: u port free <number>"
+      case "$1" in *[!0-9]*) u_die 2 "port must be a number: $1" ;; esac
+      if u_port_busy "$1"; then return 1; else return 0; fi
+      ;;
+    kill)
+      shift
+      [ "$#" -ge 1 ] || u_die 2 "usage: u port kill <number> [--yes]"
+      local n=$1 pid
+      case "$n" in *[!0-9]*) u_die 2 "port must be a number: $n" ;; esac
+      pid=$(u_port_pid "$n")
+      [ -n "$pid" ] || u_die 1 "no listener found on port $n"
+      printf 'port %s -> pid %s\n' "$n" "$pid"
+      ps -o pid,ppid,user,command -p "$pid" 2>/dev/null || true
+      u_confirm "kill pid $pid?" || return 1
+      kill "$pid" 2>/dev/null || u_die 1 "kill failed for pid $pid"
+      sleep 1
+      if kill -0 "$pid" 2>/dev/null; then
+        u_err "pid $pid is still alive"
+        return 1
+      fi
+      printf 'killed pid %s\n' "$pid"
+      ;;
+    *)
+      local out
+      out=$(u_port_list)
+      case "$sub" in
+        *[!0-9]*)
+          printf '%s\n' "$out" | grep -F -- "$sub"
+          ;;
+        *)
+          printf '%s\n' "$out" | grep -F ":$sub "
+          ;;
+      esac
+      ;;
+  esac
+}
+
+#heavy
+u_cmd_pid() {
+  [ "$#" -ge 1 ] || u_die 2 "usage: u pid <pid|name>"
+  local target=$1
+  case "$target" in
+    *[!0-9]*)
+      if u_has_cmd pgrep; then
+        pgrep -fl "$target" || u_die 1 "no process matches: $target"
+      else
+        ps aux | grep -F -- "$target" | grep -v grep || u_die 1 "no process matches: $target"
+      fi
+      ;;
+    *)
+      ps -o pid,ppid,user,command -p "$target" 2>/dev/null || u_die 1 "pid not found: $target"
+      local p=$target n=0
+      while [ -n "$p" ] && [ "$p" != 0 ] && [ "$p" != 1 ] && [ "$n" -lt 20 ]; do
+        p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')
+        [ -n "$p" ] || break
+        [ "$p" = 1 ] && break
+        printf '%s\n' '--- parent ---'
+        ps -o pid,ppid,user,command -p "$p" 2>/dev/null
+        n=$((n + 1))
+      done
+      if u_has_cmd lsof; then
+        printf '%s\n' '--- listeners ---'
+        lsof -nP -a -p "$target" -iTCP -sTCP:LISTEN 2>/dev/null | tail -n +2
+      fi
+      ;;
+  esac
+}
+
+#heavy
+u_cmd_proc() {
+  local argv=() a
+  for a in "$@"; do
+    case "$a" in
+      --yes|-y) U_YES=1 ;;
+      *) argv+=("$a") ;;
+    esac
+  done
+  set -- "${argv[@]}"
+  local mode=cpu q="" target=""
+  case "${1:-}" in
+    "")
+      mode=cpu
+      ;;
+    --cpu|-c)
+      mode=cpu
+      ;;
+    --mem|-m)
+      mode=mem
+      ;;
+    kill)
+      mode=kill
+      shift
+      target=${1:-}
+      [ -n "$target" ] || u_die 2 "usage: u proc kill <name|pid> [--yes]"
+      ;;
+    *)
+      mode=grep
+      q=$1
+      ;;
+  esac
+
+  if ! ps aux >/dev/null 2>&1; then
+    u_die 3 "ps is not usable on this system"
+  fi
+
+  case "$mode" in
+    cpu)
+      ps aux | head -n 1
+      ps aux | tail -n +2 | sort -k3,3 -n -r | head -n 15
+      ;;
+    mem)
+      ps aux | head -n 1
+      ps aux | tail -n +2 | sort -k4,4 -n -r | head -n 15
+      ;;
+    grep)
+      ps aux | head -n 1
+      ps aux | grep -F -- "$q" | grep -v grep
+      ;;
+    kill)
+      case "$target" in
+        *[!0-9]*)
+          ps aux | grep -F -- "$target" | grep -v grep || u_die 1 "no process matches: $target"
+          u_confirm "kill every process matching $target?" || return 1
+          pkill -f "$target" 2>/dev/null || u_die 1 "pkill failed: $target"
+          printf 'sent TERM to processes matching %s\n' "$target"
+          ;;
+        *)
+          ps -o pid,command -p "$target" 2>/dev/null || u_die 1 "pid not found: $target"
+          u_confirm "kill pid $target?" || return 1
+          kill "$target" 2>/dev/null || u_die 1 "kill failed: $target"
+          printf 'sent TERM to pid %s\n' "$target"
+          ;;
+      esac
+      ;;
+  esac
+}
+
+u_screen_sessions() {
+  screen -ls 2>/dev/null | awk '/Detached|Attached/ { print $1 }'
+}
+
+#heavy
+u_cmd_screen() {
+  u_need_cmd screen
+  local argv=() a
+  for a in "$@"; do
+    case "$a" in
+      --yes|-y) U_YES=1 ;;
+      *) argv+=("$a") ;;
+    esac
+  done
+  set -- "${argv[@]}"
+  local sub=${1:-}
+  case "$sub" in
+    "")
+      [ -z "${STY:-}" ] || u_die 4 "already inside screen; use: u screen detach"
+      local sessions
+      sessions=$(u_screen_sessions)
+      if [ -z "$sessions" ]; then
+        [ -t 0 ] || u_die 4 "screen needs a tty; run u screen new <name> from a terminal"
+        screen -S u
+      elif [ "$(printf '%s\n' "$sessions" | wc -l | tr -d ' ')" = 1 ]; then
+        screen -r "$sessions"
+      else
+        local pick
+        pick=$(u_choose "choose a screen session:" $sessions) || {
+          printf '%s\n' "$sessions"
+          u_die 2 "choose a session: u screen attach <name>"
+        }
+        screen -r "$pick"
+      fi
+      ;;
+    ls|list)
+      if ! screen -ls 2>/dev/null; then
+        printf 'no screen sessions\n'
+      fi
+      ;;
+    new)
+      [ -z "${STY:-}" ] || u_die 4 "already inside screen"
+      shift
+      local name=${1:-u}
+      [ -t 0 ] || u_die 4 "screen needs a tty"
+      screen -S "$name"
+      ;;
+    attach|a|r)
+      shift
+      [ "$#" -ge 1 ] || u_die 2 "usage: u screen attach <name>"
+      local target=$1
+      if ! screen -ls 2>/dev/null | grep -qF "$target"; then
+        u_die 1 "no screen session matches: $target"
+      fi
+      screen -r "$target"
+      ;;
+    detach)
+      if [ -n "${STY:-}" ]; then
+        screen -X detach
+      else
+        screen -d
+      fi
+      ;;
+    kill)
+      shift
+      local sessions target
+      sessions=$(u_screen_sessions)
+      target=${1:-}
+      if [ -z "$target" ] && [ -n "${STY:-}" ]; then
+        target=$STY
+      fi
+      if [ -z "$target" ]; then
+        if [ "$(printf '%s\n' "$sessions" | grep -c .)" = 1 ]; then
+          target=$sessions
+        else
+          u_die 2 "usage: u screen kill <name> (or run inside the session)"
+        fi
+      fi
+      if ! printf '%s\n' "$sessions" | grep -qF "$target"; then
+        u_die 1 "no screen session matches: $target"
+      fi
+      u_confirm "quit screen session $target?" || return 1
+      screen -S "$target" -X quit
+      printf 'quit %s\n' "$target"
+      ;;
+    *)
+      u_die 2 "usage: u screen [ls|new|attach|detach|kill]"
+      ;;
+  esac
+}
+
+# --- dev and services ------------------------------------------------------
+u_edit_file() {
+  local f=$1
+  if [ -n "${EDITOR:-}" ]; then
+    "$EDITOR" "$f"
+  elif u_has_cmd code; then
+    code "$f"
+  elif u_has_cmd nano; then
+    nano "$f"
+  elif u_has_cmd vi; then
+    vi "$f"
+  else
+    u_die 3 "no editor found; set EDITOR"
+  fi
+}
+
+u_quick_file() {
+  printf '%s/%s\n' "$U_QUICK" "$1"
+}
+
+#heavy
+u_cmd_q() {
+  local a
+  for a in "$@"; do
+    case "$a" in -h|--help) u_usage q; return 0 ;; esac
+  done
+  u_ensure_dirs
+  case "${1:-}" in
+    "")
+      local f name first
+      for f in "$U_QUICK"/*; do
+        [ -f "$f" ] || continue
+        name=${f##*/}
+        first=$(grep -m1 -v -e '^#' -e '^$' "$f" 2>/dev/null)
+        printf '%s\t%s\n' "$name" "$first"
+      done
+      ;;
+    ls|list)
+      shift
+      local f name first
+      for f in "$U_QUICK"/*; do
+        [ -f "$f" ] || continue
+        name=${f##*/}
+        first=$(grep -m1 -v -e '^#' -e '^$' "$f" 2>/dev/null)
+        printf '%s\t%s\n' "$name" "$first"
+      done
+      ;;
+    add)
+      shift
+      local name=${1:-}
+      [ -n "$name" ] || u_die 2 "usage: u q add <name> [command...]"
+      u_valid_name "$name" || u_die 2 "invalid quick name: $name"
+      shift || true
+      local file cmd=""
+      file=$(u_quick_file "$name")
+      if [ "$#" -gt 0 ]; then
+        cmd="$*"
+      elif [ ! -t 0 ]; then
+        cmd=$(cat)
+      fi
+      {
+        printf '#!/usr/bin/env bash\n'
+        printf '# u quick: %s\n' "$name"
+        [ -n "$cmd" ] && printf '%s\n' "$cmd"
+      } >"$file" || u_die 4 "cannot write: $file"
+      chmod 755 "$file"
+      if [ -z "$cmd" ] && [ -t 0 ]; then
+        u_edit_file "$file"
+      fi
+      printf '%s\n' "$file"
+      ;;
+    run)
+      shift
+      local name=${1:-}
+      [ -n "$name" ] || u_die 2 "usage: u q run <name> [args...]"
+      shift || true
+      local file
+      file=$(u_quick_file "$name")
+      [ -f "$file" ] || u_die 1 "no quick command: $name"
+      bash "$file" "$@"
+      ;;
+    cat|show)
+      shift
+      local name=${1:-}
+      [ -n "$name" ] || u_die 2 "usage: u q cat <name>"
+      local file
+      file=$(u_quick_file "$name")
+      [ -f "$file" ] || u_die 1 "no quick command: $name"
+      cat "$file"
+      ;;
+    edit)
+      shift
+      local name=${1:-}
+      [ -n "$name" ] || u_die 2 "usage: u q edit <name>"
+      local file
+      file=$(u_quick_file "$name")
+      [ -f "$file" ] || u_die 1 "no quick command: $name"
+      u_edit_file "$file"
+      ;;
+    path)
+      shift
+      local name=${1:-}
+      [ -n "$name" ] || u_die 2 "usage: u q path <name>"
+      u_quick_file "$name"
+      ;;
+    rm|remove)
+      shift
+      local name=${1:-}
+      [ -n "$name" ] || u_die 2 "usage: u q rm <name>"
+      local file
+      file=$(u_quick_file "$name")
+      [ -f "$file" ] || u_die 1 "no quick command: $name"
+      u_trash_put "$file"
+      ;;
+    -*)
+      u_die 2 "usage: u q [<name> [args...]] | ls | add | run | cat | edit | path | rm"
+      ;;
+    *)
+      local name=$1
+      shift || true
+      local file
+      file=$(u_quick_file "$name")
+      [ -f "$file" ] || u_die 1 "no quick command: $name"
+      bash "$file" "$@"
+      ;;
+  esac
+}
+
+#heavy
+u_cmd_clone() {
+  local ssh=0 dir="${U_CLONE_DIR:-$HOME/Documents}" target="" a
+  while [ "$#" -gt 0 ]; do
+    a=$1
+    case "$a" in
+      --ssh) ssh=1 ;;
+      --dir)
+        shift
+        dir=${1:-}
+        [ -n "$dir" ] || u_die 2 "--dir needs a directory"
+        ;;
+      -*) u_die 2 "unknown option: $a" ;;
+      *) target=$a ;;
+    esac
+    shift
+  done
+  [ -n "$target" ] || u_die 2 "usage: u clone [--ssh] [--dir DIR] <owner/repo|url>"
+  dir=$(u_expand "$dir")
+  u_need_cmd git
+  local url name dest
+  case "$target" in
+    http*|git@*|ssh://*|*://*)
+      url=$target
+      ;;
+    */*)
+      case "$target" in
+        *.git) ;;
+        *) target="$target.git" ;;
+      esac
+      if [ "$ssh" = 1 ]; then
+        url="git@github.com:${target}"
+      else
+        url="https://github.com/${target}"
+      fi
+      ;;
+    *)
+      local user=${U_GIT_USER:-}
+      if [ -z "$user" ]; then
+        if [ -t 0 ]; then
+          user=$(u_prompt "GitHub user for $target:")
+        fi
+        [ -n "$user" ] || u_die 2 "pass owner/repo or set U_GIT_USER"
+      fi
+      if [ "$ssh" = 1 ]; then
+        url="git@github.com:${user}/${target}.git"
+      else
+        url="https://github.com/${user}/${target}.git"
+      fi
+      ;;
+  esac
+  name=${target##*/}
+  name=${name%.git}
+  dest="$dir/$name"
+  [ -e "$dest" ] && u_die 5 "destination already exists: $dest"
+  mkdir -p "$dir" || u_die 4 "cannot create: $dir"
+  git clone "$url" "$dest" || u_die 1 "clone failed: $url"
+  printf '%s\n' "$dest"
+}
+
+#heavy
+u_cmd_g() {
+  local a
+  for a in "$@"; do
+    case "$a" in -h|--help) u_usage g; return 0 ;; esac
+  done
+  u_scan_yes "$@"
+  u_need_cmd git
+  local sub=${1:-}
+  case "$sub" in
+    ""|log)
+      shift || true
+      local n=${1:-30}
+      case "$n" in *[!0-9]*) u_die 2 "count must be a number: $n" ;; esac
+      git log --all --decorate --oneline --graph -n "$n"
+      ;;
+    st|status)
+      git status -sb
+      ;;
+    co|checkout)
+      shift
+      [ "$#" -ge 1 ] || u_die 2 "usage: u g co <ref>"
+      git checkout "$1"
+      ;;
+    reset)
+      shift
+      [ "$#" -ge 1 ] || u_die 2 "usage: u g reset <ref> [--yes]"
+      local ref=$1
+      u_confirm "hard reset $PWD to $ref?" || return 1
+      git reset --hard "$ref"
+      ;;
+    branches|br)
+      git branch -vv
+      ;;
+    *)
+      u_die 2 "usage: u g [log [n]] [st] [co <ref>] [reset <ref>] [branches]"
+      ;;
+  esac
+}
+
+u_dk_names() {
+  command docker ps -a --format '{{.Names}}' 2>/dev/null
+}
+
+u_dk_image_names() {
+  command docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null
+}
+
+u_dk_pick() {
+  local q=$1 names=$2 n exact="" matches="" count=0 old_ifs
+  [ -n "$names" ] || return 1
+  old_ifs=$IFS
+  IFS=$'\n'
+  for n in $names; do
+    if [ "$n" = "$q" ]; then
+      exact=$n
+      break
+    fi
+  done
+  if [ -n "$exact" ]; then
+    IFS=$old_ifs
+    printf '%s\n' "$exact"
+    return 0
+  fi
+  for n in $names; do
+    case "$n" in
+      "$q"*)
+        matches="${matches}${n}"$'\n'
+        count=$((count + 1))
+        ;;
+    esac
+  done
+  IFS=$old_ifs
+  if [ "$count" -eq 1 ]; then
+    printf '%s\n' "${matches%$'\n'}"
+    return 0
+  fi
+  if [ "$count" -gt 1 ]; then
+    u_err "ambiguous name: $q"
+    printf '%s' "$matches" >&2
+  fi
+  return 1
+}
+
+#heavy
+u_cmd_dk() {
+  u_scan_yes "$@"
+  u_need_cmd docker
+  local sub=${1:-}
+  case "$sub" in
+    ""|ps)
+      command docker ps -a
+      ;;
+    images)
+      command docker images
+      ;;
+    stats)
+      command docker stats --no-stream
+      ;;
+    inspect)
+      shift
+      [ "$#" -ge 1 ] || u_die 2 "usage: u dk inspect <name>"
+      local name
+      name=$(u_dk_pick "$1" "$(u_dk_names)") || name=$1
+      command docker inspect "$name"
+      ;;
+    logs)
+      shift
+      [ "$#" -ge 1 ] || u_die 2 "usage: u dk logs <name> [-f]"
+      local name follow=0
+      name=$(u_dk_pick "$1" "$(u_dk_names)") || u_die 1 "container not found: $1"
+      shift
+      case "${1:-}" in -f|--follow) follow=1 ;; esac
+      if [ "$follow" = 1 ]; then
+        command docker logs -f --tail 500 "$name"
+      else
+        command docker logs --tail 500 "$name"
+      fi
+      ;;
+    sh|shell|exec)
+      shift
+      [ "$#" -ge 1 ] || u_die 2 "usage: u dk sh <name>"
+      local name
+      name=$(u_dk_pick "$1" "$(u_dk_names)") || u_die 1 "container not found: $1"
+      command docker exec -it "$name" sh -c '[ -x /bin/bash ] && exec /bin/bash || exec /bin/sh'
+      ;;
+    run)
+      shift
+      [ "$#" -ge 1 ] || u_die 2 "usage: u dk run <image> [command...]"
+      local image=$1
+      shift
+      if [ "$#" -gt 0 ]; then
+        command docker run --rm -it "$image" "$@"
+      else
+        command docker run --rm -it --entrypoint sh "$image" -c '[ -x /bin/bash ] && exec /bin/bash || exec /bin/sh'
+      fi
+      ;;
+    stop)
+      shift
+      [ "$#" -ge 1 ] || u_die 2 "usage: u dk stop <name>"
+      local name
+      name=$(u_dk_pick "$1" "$(u_dk_names)") || u_die 1 "container not found: $1"
+      command docker stop "$name"
+      ;;
+    rm|remove)
+      shift
+      [ "$#" -ge 1 ] || u_die 2 "usage: u dk rm <name>"
+      local name
+      name=$(u_dk_pick "$1" "$(u_dk_names)") || u_die 1 "container not found: $1"
+      command docker rm "$name"
+      ;;
+    save)
+      shift
+      [ "$#" -ge 1 ] || u_die 2 "usage: u dk save <name> [file]"
+      local image file
+      image=$(u_dk_pick "$1" "$(u_dk_image_names)") || u_die 1 "image not found: $1"
+      file=${2:-}
+      [ -n "$file" ] || file=$(printf '%s' "$image" | sed 's|/|-|g; s|:|-|g').tar
+      command docker save -o "$file" "$image" && printf '%s\n' "$file"
+      ;;
+    load)
+      shift
+      [ "$#" -ge 1 ] || u_die 2 "usage: u dk load <file>"
+      [ -f "$1" ] || u_die 1 "not found: $1"
+      command docker load -i "$1"
+      ;;
+    clean)
+      u_confirm "remove unused docker data?" || return 1
+      command docker system prune -f
+      ;;
+    *)
+      u_die 2 "usage: u dk [ps|images|stats|inspect|logs|sh|run|stop|rm|save|load|clean]"
+      ;;
+  esac
+}
+
+u_compose() {
+  if command docker compose version >/dev/null 2>&1; then
+    command docker compose "$@"
+  elif u_has_cmd docker-compose; then
+    docker-compose "$@"
+  else
+    u_die 3 "docker compose is not available"
+  fi
+}
+
+u_compose_file() {
+  [ -n "${COMPOSE_FILE:-}" ] && return 0
+  local f
+  for f in docker-compose.yml docker-compose.yaml compose.yml compose.yaml; do
+    [ -f "$f" ] && return 0
+  done
+  return 1
+}
+
+u_compose_services() {
+  u_compose ps --services 2>/dev/null
+}
+
+u_compose_pick() {
+  local q=$1 services
+  services=$(u_compose_services)
+  [ -n "$services" ] || return 1
+  u_dk_pick "$q" "$services"
+}
+
+#heavy
+u_cmd_dc() {
+  u_need_cmd docker
+  local sub=${1:-}
+  case "$sub" in
+    up)
+      u_compose_file || u_die 3 "no compose file in $PWD"
+      if [ -f .env ]; then
+        u_compose --env-file .env up -d
+      else
+        u_compose up -d
+      fi
+      ;;
+    down)
+      u_compose_file || u_die 3 "no compose file in $PWD"
+      u_compose down --remove-orphans
+      ;;
+    ps|status)
+      u_compose_file || u_die 3 "no compose file in $PWD"
+      u_compose ps -a
+      ;;
+    logs)
+      u_compose_file || u_die 3 "no compose file in $PWD"
+      shift
+      local svc="" follow=0 a
+      for a in "$@"; do
+        case "$a" in
+          -f|--follow) follow=1 ;;
+          -*) u_die 2 "unknown option: $a" ;;
+          *) svc=$a ;;
+        esac
+      done
+      local -a cmd=(logs --tail 500)
+      [ "$follow" = 1 ] && cmd+=(-f)
+      [ -n "$svc" ] && cmd+=("$svc")
+      u_compose "${cmd[@]}"
+      ;;
+    sh|shell)
+      u_compose_file || u_die 3 "no compose file in $PWD"
+      shift
+      local svc=${1:-}
+      if [ -z "$svc" ]; then
+        svc=$(u_compose_pick "" ) || u_die 2 "no running service; pass a service name"
+      fi
+      u_compose exec -it "$svc" sh -c '[ -x /bin/bash ] && exec /bin/bash || exec /bin/sh'
+      ;;
+    exec)
+      u_compose_file || u_die 3 "no compose file in $PWD"
+      shift
+      [ "$#" -ge 2 ] || u_die 2 "usage: u dc exec <service> <command...>"
+      local svc=$1
+      shift
+      u_compose exec "$svc" "$@"
+      ;;
+    build)
+      u_compose_file || u_die 3 "no compose file in $PWD"
+      shift
+      local nocache=0
+      case "${1:-}" in --no-cache) nocache=1 ;; esac
+      if [ "$nocache" = 1 ]; then
+        u_compose build --no-cache --progress plain
+      else
+        u_compose build --progress plain
+      fi
+      ;;
+    restart)
+      u_compose_file || u_die 3 "no compose file in $PWD"
+      shift
+      if [ "$#" -ge 1 ]; then
+        u_compose restart "$1"
+      else
+        u_compose restart
+      fi
+      ;;
+    stop)
+      u_compose_file || u_die 3 "no compose file in $PWD"
+      u_compose stop
+      ;;
+    images)
+      u_compose_file || u_die 3 "no compose file in $PWD"
+      u_compose images
+      ;;
+    *)
+      u_die 2 "usage: u dc [up|down|ps|logs|sh|exec|build|restart|stop|images]"
+      ;;
+  esac
+}
+
+u_svc_kind() {
+  if u_has_cmd systemctl; then
+    printf 'systemd\n'
+  elif u_has_cmd rc-service; then
+    printf 'openrc\n'
+  elif u_has_cmd launchctl; then
+    printf 'launchctl\n'
+  elif u_has_cmd sc.exe; then
+    printf 'sc\n'
+  else
+    printf 'none\n'
+  fi
+}
+
+u_svc_names() {
+  local kind=$1
+  case "$kind" in
+    systemd) systemctl list-units --type=service --no-legend --no-pager 2>/dev/null | awk '{ print $1 }' ;;
+    openrc) rc-status --servicelist 2>/dev/null | awk '{ print $1 }' ;;
+    launchctl) launchctl list 2>/dev/null | awk 'NR > 1 { print $3 }' ;;
+    sc) sc.exe query state= all 2>/dev/null | tr -d '\r' | awk '/SERVICE_NAME/{ print $2 }' ;;
+  esac
+}
+
+u_svc_resolve() {
+  local kind=$1 q=$2 names
+  names=$(u_svc_names "$kind")
+  [ -n "$names" ] || return 1
+  u_dk_pick "$q" "$names"
+}
+
+#heavy
+u_cmd_svc() {
+  local kind sub name
+  kind=$(u_svc_kind)
+  [ "$kind" != none ] || u_die 3 "no supported service manager found"
+  sub=${1:-}
+  case "$sub" in
+    ""|ls|list)
+      u_svc_names "$kind"
+      ;;
+    status)
+      shift
+      [ "$#" -ge 1 ] || u_die 2 "usage: u svc status <name>"
+      name=$1
+      case "$kind" in
+        systemd) systemctl status --no-pager "$name" ;;
+        openrc) rc-service "$name" status ;;
+        launchctl) launchctl list | grep -F "$name" ;;
+        sc) sc.exe query "$name" ;;
+      esac
+      ;;
+    start|stop|restart|enable|disable)
+      shift
+      [ "$#" -ge 1 ] || u_die 2 "usage: u svc $sub <name>"
+      name=$(u_svc_resolve "$kind" "$1") || name=$1
+      case "$kind" in
+        systemd)
+          case "$sub" in
+            start|stop|restart)
+              u_root systemctl "$sub" "$name"
+              ;;
+            enable) u_root systemctl enable "$name" ;;
+            disable) u_root systemctl disable "$name" ;;
+          esac
+          ;;
+        openrc)
+          case "$sub" in
+            start|stop|restart) u_root rc-service "$name" "$sub" ;;
+            enable) u_root rc-update add "$name" default ;;
+            disable) u_root rc-update del "$name" default ;;
+          esac
+          ;;
+        launchctl)
+          u_die 3 "launchctl start/stop is not implemented; use launchctl directly"
+          ;;
+        sc)
+          case "$sub" in
+            start) u_root sc.exe start "$name" ;;
+            stop) u_root sc.exe stop "$name" ;;
+            restart)
+              u_root sc.exe stop "$name"
+              u_root sc.exe start "$name"
+              ;;
+            enable) u_root sc.exe config "$name" start= auto ;;
+            disable) u_root sc.exe config "$name" start= disabled ;;
+          esac
+          ;;
+      esac
+      ;;
+    *)
+      u_die 2 "usage: u svc [ls|status|start|stop|restart|enable|disable] [name]"
+      ;;
+  esac
+}
+
+#heavy
+u_cmd_open() {
+  local app="" target=""
+  case "${1:-}" in
+    --app)
+      shift
+      app=${1:-}
+      [ -n "$app" ] || u_die 2 "--app needs a name"
+      ;;
+    *)
+      target=${1:-}
+      ;;
+  esac
+  if [ -n "$app" ]; then
+    [ "$U_OS" = mac ] || u_die 3 "--app is macOS only"
+    open -a "$app" 2>/dev/null || u_die 1 "no application matches: $app"
+    return 0
+  fi
+  [ -n "$target" ] || u_die 2 "usage: u open <path|url>"
+  case "$target" in
+    http://*|https://*|mailto:*)
+      ;;
+    *)
+      [ -e "$target" ] || u_die 1 "not found: $target"
+      target=$(u_abs "$target")
+      ;;
+  esac
+  case "$U_OS" in
+    mac) open "$target" ;;
+    linux) u_need_cmd xdg-open; xdg-open "$target" >/dev/null 2>&1 & ;;
+    windows) cmd.exe //c start "" "$target" ;;
+    *) u_die 3 "unsupported platform" ;;
+  esac
+}
+
+u_cmd_edit() {
+  local file=${1:-$U_SELF}
+  [ -f "$file" ] || u_die 1 "not found: $file"
+  u_edit_file "$file"
+}
+
+u_cmd_log() {
+  local lines=1000 file="" msg="" a
+  while [ "$#" -gt 0 ]; do
+    a=$1
+    case "$a" in
+      --lines|-n)
+        shift
+        lines=${1:-}
+        case "$lines" in ''|*[!0-9]*) u_die 2 "--lines needs a number" ;; esac
+        [ "$lines" -ge 1 ] || u_die 2 "--lines must be at least 1"
+        ;;
+      -*)
+        u_die 2 "unknown option: $a"
+        ;;
+      *)
+        if [ -z "$file" ]; then
+          file=$a
+        else
+          msg="$msg $a"
+        fi
+        ;;
+    esac
+    shift
+  done
+  [ -n "$file" ] || u_die 2 "usage: u log [--lines N] <file> <message...>"
+  local dir
+  dir=$(dirname "$file")
+  [ -d "$dir" ] || u_die 1 "directory not found: $dir"
+  printf '%s\t%s\n' "$(u_now_iso)" "${msg# }" >>"$file"
+  local count
+  count=$(wc -l <"$file" | tr -d ' ')
+  if [ "$count" -gt "$lines" ]; then
+    local half=$((lines / 2)) tmp
+    [ "$half" -lt 1 ] && half=1
+    tmp="$file.$$.tmp"
+    tail -n "$half" "$file" >"$tmp" && mv "$tmp" "$file"
+  fi
+}
+
+# --- debug helpers ---------------------------------------------------------
+u_cmd__path() {
+  printf '%s\n' "$U_SELF_DIR"
+}
+
+u_cmd__file() {
+  printf '%s\n' "$U_SELF"
+}
+
+u_cmd__catalog() {
+  u_catalog
+}
+
+u_cmd__selftest() {
+  local fails=0 checks=0
+  chk() {
+    local label=$1
+    shift
+    checks=$((checks + 1))
+    if "$@"; then
+      return 0
+    fi
+    printf 'FAIL: %s\n' "$label" >&2
+    fails=$((fails + 1))
+    return 0
+  }
+  chk "epoch 0" test "$(u_epoch 0)" = 0
+  chk "format epoch" test "$(TZ=UTC u_fmt_epoch 0 '%Y-%m-%d')" = "1970-01-01"
+  chk "str eq" u_cmd_str eq a a
+  chk "str eq differs" eval '! u_cmd_str eq a b'
+  chk "str contains" u_cmd_str contains "hello world" "lo wo"
+  chk "has sh" u_has_cmd sh
+  chk "valid name" u_valid_name "abc-1.2"
+  chk "invalid name" eval '! u_valid_name "a/b"'
+  chk "valid env" u_valid_env_name "HOME"
+  chk "invalid env" eval '! u_valid_env_name "1BAD"'
+
+  local names n fn
+  names=$(u_catalog | cut -d'|' -f1)
+  for n in $names; do
+    checks=$((checks + 1))
+    if ! u_usage "$n" >/dev/null 2>&1; then
+      printf 'FAIL: usage for %s\n' "$n" >&2
+      fails=$((fails + 1))
+    fi
+    checks=$((checks + 1))
+    fn="u_cmd_${n//-/_}"
+    if ! command -v "$fn" >/dev/null 2>&1; then
+      printf 'FAIL: dispatch for %s (missing %s)\n' "$n" "$fn" >&2
+      fails=$((fails + 1))
+    fi
+  done
+
+  if [ "$fails" -eq 0 ]; then
+    printf 'ok: %s checks\n' "$checks"
+    return 0
+  fi
+  printf '%s of %s checks failed\n' "$fails" "$checks" >&2
+  return 1
+}
+
+# --- dispatch --------------------------------------------------------------
+u_main() {
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --debug) U_DEBUG=1; shift ;;
+      --json) U_JSON=1; shift ;;
+      --yes|-y) U_YES=1; shift ;;
+      --)
+        shift
+        break
+        ;;
+      -h|--help)
+        u_help
+        return 0
+        ;;
+      -V|--version)
+        u_cmd_version
+        return 0
+        ;;
+      -*)
+        u_die 2 "unknown global option: $1 (see: u help)"
+        ;;
+      *)
+        break
+        ;;
+    esac
+  done
+
+  if [ "$#" -eq 0 ]; then
+    u_help
+    return 0
+  fi
+
+  U_CMD=$1
+  shift
+  _ED "command=$U_CMD args=$*"
+
+  local alias=$U_CMD
+  case "$U_CMD" in
+    install|remove|rmpkg|upgrade) U_CMD=pkg ;;
+    search) U_CMD=find ;;
+    string) U_CMD=str ;;
+    dates) U_CMD=date ;;
+    password) U_CMD=pw ;;
+    process) U_CMD=proc ;;
+    syscheck) U_CMD=doctor ;;
+    gitclone) U_CMD=clone ;;
+    docker) U_CMD=dk ;;
+    git) U_CMD=g ;;
+    service) U_CMD=svc ;;
+    quick) U_CMD=q ;;
+    logfile) U_CMD=log ;;
+    noproxy) U_CMD=np ;;
+    update) U_CMD=self-update ;;
+    sf) U_CMD=find ;;
+    b64d|b64e) U_CMD=b64 ;;
+    download|download-git) U_CMD=dl ;;
+  esac
+
+  if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
+    u_usage "$U_CMD"
+    return 0
+  fi
+
+  case "$alias" in
+    install) set -- install "$@" ;;
+    remove|rmpkg) set -- remove "$@" ;;
+    upgrade)
+      if [ "$#" -eq 0 ]; then
+        set -- update
+      else
+        set -- upgrade "$@"
+      fi
+      ;;
+    sf) set -- --name "$@" ;;
+    b64d) set -- --decode "$@" ;;
+    download-git) set -- --github "$@" ;;
+  esac
+
+  local fn="u_cmd_${U_CMD//-/_}"
+  if command -v "$fn" >/dev/null 2>&1; then
+    "$fn" "$@"
+  else
+    u_die 2 "unknown command: $U_CMD (see: u help)"
+  fi
+}
+
+U_HELP_ALL=0
+U_SELF=$(u_self_path)
+U_SELF_DIR=$(cd -P "$(dirname "$U_SELF")" 2>/dev/null && pwd)
+u_detect
+
+if [ "${U_NO_MAIN:-0}" != 1 ] && [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  u_main "$@"
+fi
