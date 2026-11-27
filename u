@@ -977,23 +977,40 @@ u_download_to() {
 
 u_update_urls() {
   [ -n "${U_UPDATE_URL:-}" ] && printf '%s\n' "$U_UPDATE_URL"
+  printf 'https://cdn.jsdelivr.net/gh/%s@%s/u\n' "$U_REPO" "$U_BRANCH"
   printf '%s\n' "$U_RAW"
   local prefix
   for prefix in \
     "https://fastgit.cc/" \
-    "http://gh.ddlc.top/" \
-    "http://ghfast.top/" \
+    "https://cdn.akaere.online/" \
     "https://ghproxy.monkeyray.net/" \
-    "https://cdn.akaere.online/"
+    "http://ghfast.top/" \
+    "http://gh.ddlc.top/"
   do
     printf '%s%s\n' "$prefix" "$U_RAW"
   done
 }
 
+# True when version $1 is greater than or equal to $2.
+u_version_ge() {
+  local a=$1 b=$2 i=1 x y
+  while [ "$i" -le 4 ]; do
+    x=$(printf '%s' "$a" | cut -d. -f"$i")
+    y=$(printf '%s' "$b" | cut -d. -f"$i")
+    x=${x:-0}
+    y=${y:-0}
+    case "$x$y" in *[!0-9]*) return 1 ;; esac
+    if [ "$x" -gt "$y" ]; then return 0; fi
+    if [ "$x" -lt "$y" ]; then return 1; fi
+    i=$((i + 1))
+  done
+  return 0
+}
+
 u_cmd_self_update() {
   u_ensure_dirs
   local tmp="$U_DIR/.u.new.$$"
-  local url ok=0
+  local url ok=0 newver=""
   while IFS= read -r url; do
     [ -n "$url" ] || continue
     u_log "trying $url"
@@ -1001,10 +1018,16 @@ u_cmd_self_update() {
       if head -n 1 "$tmp" | grep -q '^#!/usr/bin/env bash' &&
         grep -q '^U_VERSION=' "$tmp" &&
         bash -n "$tmp" 2>/dev/null; then
-        ok=1
-        break
+        newver=$(bash "$tmp" version 2>/dev/null || true)
+        if [ -n "$newver" ] && u_version_ge "$newver" "$U_VERSION"; then
+          ok=1
+          break
+        fi
+        u_warn "mirror has older u ($newver), trying next"
+        newver=""
       fi
     fi
+    rm -f "$tmp"
   done <<EOF
 $(u_update_urls)
 EOF
@@ -1013,9 +1036,6 @@ EOF
     u_die 1 "could not download a valid u from any mirror"
   fi
 
-  local newver
-  newver=$(bash "$tmp" version 2>/dev/null || true)
-  [ -n "$newver" ] || { rm -f "$tmp"; u_die 1 "downloaded u did not report a version"; }
   if [ "$newver" = "$U_VERSION" ]; then
     rm -f "$tmp"
     printf 'already at %s\n' "$U_VERSION"

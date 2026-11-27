@@ -51,7 +51,8 @@ if [ -n "${U_UPDATE_URL:-}" ]; then
   URLS="$U_UPDATE_URL
 "
 fi
-URLS="${URLS}https://fastgit.cc/${RAW}
+URLS="${URLS}https://cdn.jsdelivr.net/gh/${REPO}@${BRANCH}/u
+https://fastgit.cc/${RAW}
 https://cdn.akaere.online/${RAW}
 https://ghproxy.monkeyray.net/${RAW}
 http://ghfast.top/${RAW}
@@ -66,8 +67,12 @@ while IFS= read -r url; do
     head -n 1 "$TMP" | grep -q '^#!/usr/bin/env bash' &&
     grep -q '^U_VERSION=' "$TMP" &&
     bash -n "$TMP" 2>/dev/null; then
-    ok=1
-    break
+    got=$(bash "$TMP" version 2>/dev/null || true)
+    if [ "$got" = "$SCRIPT_VERSION" ]; then
+      ok=1
+      break
+    fi
+    say "stale mirror ($got), trying next"
   fi
 done <<EOF
 $URLS

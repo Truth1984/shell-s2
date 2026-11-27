@@ -26,11 +26,11 @@ Maintainers should read `.agent/private/instruction.md` before changing code.
 China-first: the installer and `u` are fetched through a mirror.
 
 ```sh
-curl -fsSL https://fastgit.cc/https://raw.githubusercontent.com/Truth1984/shell-s2/main/setup.sh \
-  | U_UPDATE_URL=https://fastgit.cc/https://raw.githubusercontent.com/Truth1984/shell-s2/main/u bash
+curl -fsSL https://cdn.jsdelivr.net/gh/Truth1984/shell-s2@main/setup.sh \
+  | U_UPDATE_URL=https://cdn.jsdelivr.net/gh/Truth1984/shell-s2@main/u bash
 ```
 
-If that mirror is down, swap `fastgit.cc` for one of these:
+If jsDelivr is down, use one of these (they may lag one release):
 
 ```sh
 # cdn.akaere.online
