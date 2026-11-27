@@ -3461,6 +3461,8 @@ u_cmd__selftest() {
   chk "invalid name" eval '! u_valid_name "a/b"'
   chk "valid env" u_valid_env_name "HOME"
   chk "invalid env" eval '! u_valid_env_name "1BAD"'
+  chk "version newer" u_version_ge 2.1.0 2.0.0
+  chk "version older" eval '! u_version_ge 2.0.0 2.1.0'
 
   local names n fn
   names=$(u_catalog | cut -d'|' -f1)
