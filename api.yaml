@@ -26,6 +26,7 @@ environment:
   U_UPDATE_URL: {default: "", description: "override self-update and installer source"}
   COMPOSE_FILE: {default: "", description: "compose file override"}
   EDITOR: {default: "", description: "editor for u edit and u q edit"}
+  U_ENV_FILE: {default: "~/.bash_env", description: "file read by u clone for user and clone directory defaults"}
 
 commands:
   - name: help
@@ -297,6 +298,12 @@ commands:
     heavy: false
     usage: "u _file"
     summary: "print the absolute path of this u"
+    exits: "0 ok; 2 usage"
+  - name: _strict
+    group: debug
+    heavy: false
+    usage: "u _strict"
+    summary: "render the eval-able dispatcher for a function-based script"
     exits: "0 ok; 2 usage"
   - name: _selftest
     group: debug

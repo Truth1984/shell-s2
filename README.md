@@ -55,9 +55,24 @@ Or from a checkout:
 ```
 
 The installer downloads `u` from the first reachable mirror, verifies it,
-installs it as `~/.application/bin/u`, and runs `u setup` to add that directory
-to your shell rc file. It does not change DNS, install packages or edit
-anything else. Re-run it, or `u self-update`, to upgrade.
+installs it as `~/.application/bin/u`, and runs `u setup`. That writes
+`~/.bash_env` (environment), `~/.bash_mine` (functions and aliases) and sources
+the shell block from your rc file. It does not change DNS or install packages.
+Re-run it, or `u self-update`, to upgrade.
+
+## Shell setup
+
+`u setup` writes two local files and sources the second from your shell rc:
+
+| File | Contents |
+| --- | --- |
+| `~/.bash_env` | environment only: PATH entries, proxy, `no_proxy`, git user and clone dir defaults. |
+| `~/.bash_mine` | functions and aliases: `cdd`, `cdb`, `cdr`, `cdt`, `_DIR`, `trash`. |
+
+`eval _DIR` sets `_DIR` to the directory of the calling script, like
+`__dirname` in Node. `cdd` changes directory and records it, `cdb` goes back,
+`cdr` records the current directory, and `cdt` lists or jumps to a recorded
+directory.
 
 ## Quick start
 
@@ -101,7 +116,7 @@ machine view is `u commands` (TSV) and `u --json commands`.
 | net | `*ip`, `*get`, `post`, `*dl`, `dns` |
 | proc | `*port`, `*pid`, `*proc`, `*screen` |
 | dev | `*q`, `*clone`, `*g`, `*dk`, `*dc`, `*svc`, `*open`, `edit`, `log` |
-| debug | `_ED`, `_RC`, `_path`, `_file`, `_selftest`, `_catalog` |
+| debug | `_ED`, `_RC`, `_path`, `_file`, `_strict`, `_selftest`, `_catalog` |
 
 Debug commands start with `_` and are hidden from `u help` unless `--all` is
 used. `_ED` always prints a debug line; `_RC` exits with a chosen code.
@@ -148,7 +163,17 @@ u has cmd curl               # silent, exit 0 or 1
 u _ED "checking cache"       # explicit debug line on stderr
 u _RC 3 "missing dependency" # debug line, then exit 3
 u _path                      # directory containing u
+u _strict                    # eval-able dispatcher for a function-based script
 ```
+
+At the end of a plain function-based script:
+
+```sh
+eval "$(u _strict)"
+```
+
+Then `./script fn args` calls `fn` with `args`, `./script help` lists the
+functions, and an unknown function exits `2` instead of failing silently.
 
 Rules an agent can rely on:
 

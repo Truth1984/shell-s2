@@ -8,7 +8,7 @@
 # It does not change DNS, install packages or edit anything outside the shell
 # rc file that `u setup` manages.
 
-SCRIPT_VERSION="2.0.0"
+SCRIPT_VERSION="2.1.0"
 REPO="Truth1984/shell-s2"
 BRANCH="main"
 RAW="https://raw.githubusercontent.com/${REPO}/${BRANCH}/u"

@@ -14,7 +14,7 @@
 # Exit codes: 0 ok, 1 failure or predicate false, 2 usage, 3 missing dependency,
 # 4 environment, 5 conflict or lock.
 
-U_VERSION="2.0.0"
+U_VERSION="2.1.0"
 U_NAME="u"
 U_REPO="Truth1984/shell-s2"
 U_BRANCH="main"
@@ -208,6 +208,14 @@ u_valid_env_name() {
     ''|[0-9]*|*[!A-Za-z0-9_]*) return 1 ;;
     *) return 0 ;;
   esac
+}
+
+# Read one variable from ~/.bash_env without changing the current environment.
+u_env_get() {
+  local name=$1 file="${U_ENV_FILE:-$HOME/.bash_env}"
+  u_valid_env_name "$name" || return 1
+  [ -r "$file" ] || return 1
+  ( unset _U_ENV_READY; . "$file" >/dev/null 2>&1; eval "printf '%s' \"\${$name:-}\"" )
 }
 
 u_ensure_dirs() {
@@ -420,6 +428,7 @@ _ED|debug|0|debug log line (always prints)
 _RC|debug|0|exit with a code, optionally logging a message
 _path|debug|0|print the directory of this u
 _file|debug|0|print the absolute path of this u
+_strict|debug|0|dispatch a plain function-based script by name
 _selftest|debug|0|run internal assertions
 _catalog|debug|0|print the raw command catalog
 EOF
@@ -702,6 +711,9 @@ u_usage() {
     _file)
       printf '%s\n' '  u _file'
       ;;
+    _strict)
+      printf '%s\n' '  # at the end of a function-based script:' '  eval "$(u _strict)"'
+      ;;
     _selftest)
       printf '%s\n' '  u _selftest'
       ;;
@@ -804,6 +816,96 @@ u_rc_file() {
   esac
 }
 
+u_shell_env_block() {
+  cat <<'EOS'
+# >>> u env >>>
+# Environment only. Shell functions and aliases live in ~/.bash_mine.
+if [ -z "${_U_ENV_READY:-}" ]; then
+  _U_ENV_READY=1
+  export BUN_INSTALL="${BUN_INSTALL:-$HOME/.bun}"
+  for _u_p in "$HOME/.application/bin" "$HOME/.npm_global/bin" "$HOME/.local/bin" "$BUN_INSTALL/bin"; do
+    case ":$PATH:" in
+      *":$_u_p:"*) ;;
+      *) if [ -d "$_u_p" ]; then export PATH="$_u_p:$PATH"; fi ;;
+    esac
+  done
+  unset _u_p
+  export no_proxy="${no_proxy:-localhost,127.0.0.1,10.96.0.0/12,192.168.0.0/16}"
+  export NO_PROXY="$no_proxy"
+  u_proxy="${u_proxy:-}"
+  case "$u_proxy" in
+    http://*|https://*) ;;
+    "") ;;
+    *) u_proxy="http://$u_proxy" ;;
+  esac
+  if [ -n "$u_proxy" ] && command -v curl >/dev/null 2>&1 && curl --output /dev/null --silent --head --max-time 2 "$u_proxy" 2>/dev/null; then
+    export https_proxy="$u_proxy" http_proxy="$u_proxy" HTTPS_PROXY="$u_proxy" HTTP_PROXY="$u_proxy"
+  fi
+  export BASH_SILENCE_DEPRECATION_WARNING=1
+  _U2_GIT_USER="${_U2_GIT_USER:-}"
+  _U2_GIT_CLONE_TO_DIR="${_U2_GIT_CLONE_TO_DIR:-$HOME/Documents}"
+  _U2_GPG_PW="${_U2_GPG_PW:-}"
+  export U_GIT_USER="${U_GIT_USER:-$_U2_GIT_USER}"
+  export U_CLONE_DIR="${U_CLONE_DIR:-$_U2_GIT_CLONE_TO_DIR}"
+fi
+# <<< u env <<<
+EOS
+}
+
+u_shell_mine_block() {
+  cat <<'EOS'
+# >>> u shell >>>
+[ -f "$HOME/.bash_env" ] && . "$HOME/.bash_env"
+if [ "$PWD" = "$HOME" ] && [ -d "$HOME/Documents" ]; then cd "$HOME/Documents"; fi
+_cdls() { ls -CFA 2>/dev/null || ls -CF; }
+cdd() { _back=$(pwd) && cd "$@" && _cdls; }
+cdb() { _oldback="$_back" && _back=$(pwd) && cd "$_oldback" && _cdls; }
+[ -n "${_U_CD_DIR+x}" ] || _U_CD_DIR=()
+cdr() { if [ -n "${1:-}" ]; then cd "$@" && _cdls; fi; _U_CD_DIR+=("$(pwd)"); }
+cdt() {
+  local i n p offset=0
+  [ -n "${ZSH_VERSION:-}" ] && offset=1
+  n=${#_U_CD_DIR[@]}
+  if [ -z "${1:-}" ]; then
+    i=0
+    while [ "$i" -lt "$n" ]; do
+      eval "p=\${_U_CD_DIR[$((i + offset))]}"
+      printf '%s: %s\n' "$i" "$p"
+      i=$((i + 1))
+    done
+  else
+    case "$1" in *[!0-9]*) return 2 ;; esac
+    eval "p=\${_U_CD_DIR[$(( $1 + offset ))]}"
+    [ -n "$p" ] && cd "$p" && _cdls
+  fi
+}
+_DIR() {
+  local _src=""
+  if [ -n "${BASH_VERSION:-}" ]; then
+    _src="${BASH_SOURCE[1]:-${BASH_SOURCE[0]}}"
+  elif [ -n "${ZSH_VERSION:-}" ]; then
+    _src="${funcfiletrace[1]%%:*}"
+  fi
+  [ -n "$_src" ] || _src="$PWD"
+  _DIR="$(cd -- "$(dirname -- "$_src")" >/dev/null 2>&1 && pwd -P)"
+}
+alias trash='u trash'
+# <<< u shell <<<
+EOS
+}
+
+# Append a marked block once. The content arrives on stdin.
+u_ensure_block() {
+  local file=$1 marker=$2
+  touch "$file" || return 1
+  if grep -qF "$marker" "$file" 2>/dev/null; then
+    _ED "block already present: $file"
+    return 0
+  fi
+  printf '\n' >>"$file" || return 1
+  cat >>"$file"
+}
+
 #heavy
 u_cmd_setup() {
   local no_rc=0
@@ -823,8 +925,24 @@ u_cmd_setup() {
   fi
 
   if [ "$no_rc" = 0 ]; then
+    u_shell_env_block | u_ensure_block "$HOME/.bash_env" "# >>> u env >>>" ||
+      u_die 4 "cannot write $HOME/.bash_env"
+    u_shell_mine_block | u_ensure_block "$HOME/.bash_mine" "# >>> u shell >>>" ||
+      u_die 4 "cannot write $HOME/.bash_mine"
+
     local rc block
     rc=$(u_rc_file)
+    if [ -f "$rc" ] && grep -qF '.bash_mine' "$rc" 2>/dev/null; then
+      u_log "shell source already present in $rc"
+    else
+      {
+        printf '\n%s\n' '# >>> u shell >>>'
+        printf '[ -f "$HOME/.bash_mine" ] && . "$HOME/.bash_mine"\n'
+        printf '%s\n' '# <<< u shell <<<'
+      } >>"$rc" || u_die 4 "cannot write $rc"
+      printf 'added the u shell block to %s\n' "$rc"
+    fi
+
     block='# >>> u >>>'
     if [ -f "$rc" ] && grep -qF "$block" "$rc" 2>/dev/null; then
       u_log "PATH block already present in $rc"
@@ -2716,7 +2834,7 @@ u_cmd_q() {
 
 #heavy
 u_cmd_clone() {
-  local ssh=0 dir="${U_CLONE_DIR:-$HOME/Documents}" target="" a
+  local ssh=0 dir="" target="" a
   while [ "$#" -gt 0 ]; do
     a=$1
     case "$a" in
@@ -2732,6 +2850,10 @@ u_cmd_clone() {
     shift
   done
   [ -n "$target" ] || u_die 2 "usage: u clone [--ssh] [--dir DIR] <owner/repo|url>"
+  if [ -z "$dir" ]; then dir=${U_CLONE_DIR:-}; fi
+  if [ -z "$dir" ]; then dir=$(u_env_get U_CLONE_DIR); fi
+  if [ -z "$dir" ]; then dir=$(u_env_get _U2_GIT_CLONE_TO_DIR); fi
+  if [ -z "$dir" ]; then dir="$HOME/Documents"; fi
   dir=$(u_expand "$dir")
   u_need_cmd git
   local url name dest
@@ -2752,6 +2874,9 @@ u_cmd_clone() {
       ;;
     *)
       local user=${U_GIT_USER:-}
+      if [ -z "$user" ]; then user=$(u_env_get U_GIT_USER); fi
+      if [ -z "$user" ]; then user=$(u_env_get _U2_GIT_USER); fi
+      if [ -z "$user" ]; then user=$(git config --global user.name 2>/dev/null); fi
       if [ -z "$user" ]; then
         if [ -t 0 ]; then
           user=$(u_prompt "GitHub user for $target:")
@@ -3255,6 +3380,42 @@ u_cmd__file() {
 
 u_cmd__catalog() {
   u_catalog
+}
+
+u_cmd__strict() {
+  cat <<'EOS'
+# u _strict: dispatch a plain function-based script by name.
+cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" >/dev/null 2>&1 || true
+if ! declare -F help >/dev/null 2>&1; then
+  help() {
+    local _fn
+    compgen -A function | sort | while IFS= read -r _fn; do
+      case "$_fn" in
+        _*) ;;
+        *) printf '%s\n' "$_fn" ;;
+      esac
+    done
+  }
+fi
+_strict_has() { declare -F "$1" >/dev/null 2>&1; }
+_strict_run() {
+  local _fn="${1:-}"
+  if [ -z "$_fn" ]; then
+    help
+    return 0
+  fi
+  if _strict_has "$_fn"; then
+    shift || true
+    "$_fn" "$@"
+    return $?
+  fi
+  printf 'u: function not found: %s\n' "$_fn" >&2
+  printf 'available functions:\n' >&2
+  help >&2
+  return 2
+}
+_strict_run "$@"
+EOS
 }
 
 u_cmd__selftest() {

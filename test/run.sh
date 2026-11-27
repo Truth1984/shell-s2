@@ -8,6 +8,7 @@ TMP=$(mktemp -d 2>/dev/null || mktemp -d -t shell-s2)
 trap 'rm -rf "$TMP"' EXIT
 export U_DIR="$TMP/state"
 export TZ=UTC
+unset U_GIT_USER U_CLONE_DIR
 mkdir -p "$U_DIR"
 
 PASS=0
@@ -69,8 +70,8 @@ check_not_contains() {
 # --- syntax and identity ---------------------------------------------------
 check_rc "bash -n u" 0 bash -n "$U"
 check_rc "bash -n setup.sh" 0 bash -n "$ROOT/setup.sh"
-check_out "version" "2.0.0" "$U" version
-check_out "version json" '{"name":"u","version":"2.0.0"}' "$U" --json version
+check_out "version" "2.1.0" "$U" version
+check_out "version json" '{"name":"u","version":"2.1.0"}' "$U" --json version
 check_rc "help" 0 "$U" help
 check_contains "help legend" "daily command" "$U" help
 check_rc "help unknown" 2 "$U" help nope
@@ -150,7 +151,7 @@ esac
 
 # --- filesystem ------------------------------------------------------------
 check_rc "find content" 0 "$U" find "U_VERSION" "$U"
-check_contains "find content line" 'U_VERSION="2.0.0"' "$U" find "U_VERSION" "$U"
+check_contains "find content line" 'U_VERSION="2.1.0"' "$U" find "U_VERSION" "$U"
 check_rc "find no match" 1 "$U" find "no_such_string_xyz_123" "$U"
 check_rc "find name" 0 "$U" find --name "u" "$ROOT"
 check_rc "stat" 0 "$U" stat "$U"
@@ -257,6 +258,16 @@ check_rc "nested pkg help" 0 "$U" pkg install --help
 check_rc "nested g help" 0 "$U" g reset --help
 check_rc "nested q help" 0 "$U" q add --help
 
+# --- function-based script dispatch ---------------------------------------
+cat >"$TMP/strict.sh" <<'EOF'
+#!/usr/bin/env bash
+hello() { echo "hello $1"; }
+eval "$("$U_UNDER_TEST" _strict)"
+EOF
+check_out "strict dispatch" "hello world" env U_UNDER_TEST="$U" bash "$TMP/strict.sh" hello world
+check_contains "strict help" "hello" env U_UNDER_TEST="$U" bash "$TMP/strict.sh"
+check_rc "strict missing function" 2 env U_UNDER_TEST="$U" bash "$TMP/strict.sh" nope
+
 # --- setup and self-update (local only) ------------------------------------
 mkdir -p "$TMP/home"
 if HOME="$TMP/home" U_DIR="$TMP/setup" "$U" setup --no-rc >/dev/null 2>&1 &&
@@ -273,7 +284,14 @@ if [ -n "$rc_file" ] && grep -qF '# >>> u >>>' "$rc_file"; then
 else
   bad "setup rc block"
 fi
-check_out "installed copy version" "2.0.0" "$TMP/setup/bin/u" version
+if grep -qF '# >>> u env >>>' "$TMP/home2/.bash_env" &&
+  grep -qF '# >>> u shell >>>' "$TMP/home2/.bash_mine" &&
+  grep -qF 'cdd' "$TMP/home2/.bash_mine"; then
+  ok
+else
+  bad "setup shell blocks"
+fi
+check_out "installed copy version" "2.1.0" "$TMP/setup/bin/u" version
 
 ver=$("$U" version)
 sed "s/^U_VERSION=\"$ver\"/U_VERSION=\"9.9.9\"/" "$U" >"$TMP/fake-u"
@@ -284,6 +302,28 @@ else
   bad "self-update"
 fi
 check_out "self-update installed version" "9.9.9" "$TMP/update/bin/u" version
+
+# --- clone reads ~/.bash_env ----------------------------------------------
+mkdir -p "$TMP/fakebin" "$TMP/clones"
+cat >"$TMP/fakebin/git" <<'EOF'
+#!/bin/sh
+printf 'GIT %s\n' "$*"
+EOF
+chmod +x "$TMP/fakebin/git"
+cat >"$TMP/clone.env" <<EOF
+U_GIT_USER=testuser
+_U2_GIT_CLONE_TO_DIR=$TMP/clones
+EOF
+clone_out=$(U_ENV_FILE="$TMP/clone.env" PATH="$TMP/fakebin:$PATH" "$U" clone --dir "$TMP/clones" bare 2>/dev/null)
+case "$clone_out" in
+  *"GIT clone https://github.com/testuser/bare.git"*) ok ;;
+  *) bad "clone did not read U_GIT_USER from bash_env ($clone_out)" ;;
+esac
+clone_out=$(U_ENV_FILE="$TMP/clone.env" PATH="$TMP/fakebin:$PATH" "$U" clone other 2>/dev/null)
+case "$clone_out" in
+  *"$TMP/clones/other"*) ok ;;
+  *) bad "clone did not read the clone dir from bash_env ($clone_out)" ;;
+esac
 
 # --- bash 3.2 compatibility ------------------------------------------------
 if [ -x /bin/bash ]; then
